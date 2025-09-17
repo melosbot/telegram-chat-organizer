@@ -1,5 +1,3 @@
-我会遵循你给我的规则
-
 # Telegram聊天分组整理工具
 
 一个自动化的Telegram聊天分组整理工具，通过AI智能分析聊天内容，帮您将群组和频道自动分类到现有文件夹中。
@@ -85,6 +83,7 @@ pip install -r requirements.txt
 如果您需要通过代理访问Telegram，请在安装依赖前设置代理：
 
 #### Windows PowerShell
+
 ```powershell
 # 设置HTTP代理
 $env:HTTP_PROXY = "http://127.0.0.1:7890"
@@ -96,6 +95,7 @@ $env:HTTPS_PROXY = "socks5://127.0.0.1:7890"
 ```
 
 #### Windows CMD
+
 ```cmd
 # 设置HTTP代理
 set HTTP_PROXY=http://127.0.0.1:7890
@@ -107,6 +107,7 @@ set HTTPS_PROXY=socks5://127.0.0.1:7890
 ```
 
 #### Linux/macOS Bash
+
 ```bash
 # 设置HTTP代理
 export HTTP_PROXY=http://127.0.0.1:7890
@@ -141,6 +142,7 @@ SESSION_NAME=mili
 ```
 
 **配置说明：**
+
 - `API_ID`：从Telegram开发者平台获取的数字ID
 - `API_HASH`：从Telegram开发者平台获取的Hash字符串
 - `SESSION_NAME`：会话文件名称（可自定义，建议保持默认）
@@ -152,6 +154,7 @@ python run.py
 ```
 
 首次运行时，程序会：
+
 1. 自动检查并创建session文件
 2. 要求您输入手机号码和验证码进行Telegram登录
 3. 成功后显示启动信息
@@ -175,14 +178,18 @@ python run.py
 当程序输出AI分类指导时，请按以下步骤操作：
 
 #### 步骤1：准备文件
+
 确认以下文件已生成：
+
 - `chats_info.json` - 聊天详细信息
 - `folders_info.json` - 文件夹信息
 
 #### 步骤2：复制提示词
+
 从控制台复制完整的提示词（不包含文件内容）
 
 #### 步骤3：使用AI服务
+
 1. **访问AI服务**：打开支持文件上传的AI对话页面
    - ChatGPT
    - Claude
@@ -197,17 +204,20 @@ python run.py
 4. **发送请求**：点击发送，等待AI分析
 
 #### 步骤4：处理AI响应
+
 1. **获取结果**：AI会返回JSON格式的分类结果
 2. **清理格式**：如果包含markdown代码块标记（```json），请手动删除
 3. **验证格式**：确保是有效的JSON格式
 
 #### 步骤5：保存结果
+
 1. **创建文件**：在项目目录下创建 `groups.json` 文件
 2. **复制内容**：将AI返回的纯JSON内容复制到文件中
 3. **保存文件**：使用UTF-8编码保存
 4. **验证格式**：可使用在线JSON验证器检查格式正确性
 
 #### 步骤6：继续执行
+
 回到程序中回复 `done`，程序将自动读取 `groups.json` 并执行分类
 
 ### JSON格式要求
@@ -233,6 +243,7 @@ AI返回的结果必须严格按照以下格式：
 ```
 
 **字段说明：**
+
 - `folder_id`: 必须是现有文件夹的ID（来自folders_info.json）
 - `folder_title`: 文件夹名称（用于显示）
 - `chat_id`: 必须是待分类聊天的ID（来自chats_info.json）
@@ -262,6 +273,7 @@ SESSION_NAME=my_account_1
 ### 环境变量优先级
 
 程序按以下优先级读取配置：
+
 1. `.env` 文件中的配置
 2. 系统环境变量
 3. 默认值
@@ -273,6 +285,7 @@ SESSION_NAME=my_account_1
 #### 1. `ModuleNotFoundError: No module named 'xxx'`
 
 **解决方案**：
+
 ```bash
 # 确保激活了虚拟环境
 source venv/bin/activate  # Linux/macOS
@@ -286,6 +299,7 @@ pip install -r requirements.txt
 #### 2. `API_ID` 或 `API_HASH` 错误
 
 **解决方案**：
+
 - 检查 `.env` 文件中的配置是否正确
 - 确认从 [https://my.telegram.org/apps](https://my.telegram.org/apps) 获取的凭据无误
 - API_ID 应该是纯数字，API_HASH 应该是32位字符串
@@ -293,6 +307,7 @@ pip install -r requirements.txt
 #### 3. Session文件创建失败
 
 **解决方案**：
+
 ```bash
 # 删除可能损坏的session文件
 rm *.session
@@ -304,6 +319,7 @@ python run.py
 #### 4. 网络连接问题
 
 **解决方案**：
+
 - 检查网络连接
 - 请配置代理（参见上面的代理设置）
 - 确认防火墙没有阻止Python程序
@@ -312,6 +328,7 @@ python run.py
 
 **解决方案**：
 程序会自动重试，如果仍然失败：
+
 ```bash
 # 关闭所有Python进程
 # 删除session文件
@@ -324,6 +341,7 @@ python run.py
 #### 6. JSON格式验证失败
 
 **解决方案**：
+
 - 使用在线JSON验证器检查 `groups.json` 格式
 - 确保AI返回的内容不包含markdown代码块标记
 - 确保所有chat_id和folder_id都是有效数字
