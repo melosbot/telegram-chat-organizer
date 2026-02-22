@@ -10,6 +10,10 @@ from typing import Any
 from telethon import TelegramClient
 from telethon.tl import functions, types
 
+RECENT_MESSAGE_LIMIT = 10
+RECENT_MESSAGE_CHAR_LIMIT = 220
+RECENT_CONTEXT_CHAR_LIMIT = 1800
+
 
 def setup_logging(log_file: Path) -> None:
     logger = logging.getLogger()
@@ -195,7 +199,58 @@ def validate_groups_json(data: dict) -> tuple[bool, str]:
         return False, f"验证失败: {exc}"
 
 
-async def get_detailed_chat_info(client: TelegramClient, dialog) -> dict:
+def _flatten_message_text(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _extract_message_excerpt(message, max_len: int = RECENT_MESSAGE_CHAR_LIMIT) -> str:
+    text = getattr(message, "message", None) or getattr(message, "raw_text", None) or ""
+    if text:
+        return _flatten_message_text(str(text))[:max_len]
+
+    action = getattr(message, "action", None)
+    if action:
+        return f"[{action.__class__.__name__}]"
+
+    media = getattr(message, "media", None)
+    if media:
+        return f"[{media.__class__.__name__}]"
+
+    return ""
+
+
+async def _fetch_recent_message_samples(
+    client: TelegramClient,
+    entity,
+    limit: int = RECENT_MESSAGE_LIMIT,
+) -> list[str]:
+    request_limit = max(limit * 2, limit)
+    try:
+        messages = await client.get_messages(entity, limit=request_limit)
+    except Exception as exc:
+        logging.debug("Could not fetch recent messages for entity %s: %s", getattr(entity, "id", "?"), exc)
+        return []
+
+    samples: list[str] = []
+    for message in messages or []:
+        if not message:
+            continue
+        text = _extract_message_excerpt(message)
+        if not text:
+            continue
+        if getattr(message, "date", None):
+            text = f"{message.date.strftime('%m-%d %H:%M')} {text}"
+        samples.append(text)
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+async def get_detailed_chat_info(
+    client: TelegramClient,
+    dialog,
+    recent_message_limit: int = RECENT_MESSAGE_LIMIT,
+) -> dict:
     entity = dialog.entity
     chat_info = {
         "chat_id": dialog.id,
@@ -206,6 +261,8 @@ async def get_detailed_chat_info(client: TelegramClient, dialog) -> dict:
         "about": "",
         "last_message": "",
         "last_message_date": "",
+        "recent_messages": [],
+        "recent_messages_text": "",
         "participant_count": 0,
         "is_verified": False,
         "is_scam": False,
@@ -251,6 +308,18 @@ async def get_detailed_chat_info(client: TelegramClient, dialog) -> dict:
             if getattr(message, "date", None):
                 chat_info["last_message_date"] = message.date.strftime("%Y-%m-%d %H:%M")
 
+        if chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
+            recent_messages = await _fetch_recent_message_samples(
+                client=client,
+                entity=entity,
+                limit=recent_message_limit,
+            )
+            if recent_messages:
+                chat_info["recent_messages"] = recent_messages
+                chat_info["recent_messages_text"] = " || ".join(recent_messages)[:RECENT_CONTEXT_CHAR_LIMIT]
+                if not chat_info["last_message"]:
+                    chat_info["last_message"] = recent_messages[0][:300]
+
         if not chat_info["description"] and chat_info["about"]:
             chat_info["description"] = chat_info["about"]
     except Exception as exc:
@@ -267,6 +336,7 @@ async def collect_dialog_map(client: TelegramClient) -> dict[int, Any]:
 async def collect_chats_for_ai(
     client: TelegramClient,
     progress_every: int = 10,
+    recent_message_limit: int = RECENT_MESSAGE_LIMIT,
 ) -> tuple[list[dict], dict[int, Any]]:
     dialogs = await client.get_dialogs()
     dialog_map = {}
@@ -289,7 +359,11 @@ async def collect_chats_for_ai(
             continue
 
         if chat_type in {"GROUP", "CHANNEL", "SUPERGROUP"}:
-            chat_info = await get_detailed_chat_info(client, dialog)
+            chat_info = await get_detailed_chat_info(
+                client=client,
+                dialog=dialog,
+                recent_message_limit=recent_message_limit,
+            )
             chats_for_ai.append(chat_info)
             processed_count += 1
             if processed_count % progress_every == 0:

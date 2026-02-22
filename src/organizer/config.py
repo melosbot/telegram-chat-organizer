@@ -135,8 +135,12 @@ def ensure_runtime_dirs(paths: PathsConfig) -> None:
 
 
 def load_config(project_root: Path | None = None) -> AppConfig:
-    # .env should override stale machine env variables.
+    # Keep .env as source of truth for most fields, but allow temporary
+    # provider switch from current shell (e.g. AI_PROVIDER=gemini python run.py).
+    runtime_ai_provider = os.getenv("AI_PROVIDER")
     load_dotenv(override=True)
+    if runtime_ai_provider is not None:
+        os.environ["AI_PROVIDER"] = runtime_ai_provider
 
     root = (project_root or Path.cwd()).resolve()
 

@@ -99,6 +99,15 @@ def _build_chat_lookup(chats_for_ai: list[dict]) -> dict[int, dict]:
     return {int(chat["chat_id"]): chat for chat in chats_for_ai if chat.get("chat_id") is not None}
 
 
+def _cache_has_recent_messages(chats_for_ai: list[dict]) -> bool:
+    for chat in chats_for_ai:
+        if not isinstance(chat, dict):
+            return False
+        if "recent_messages" not in chat or "recent_messages_text" not in chat:
+            return False
+    return True
+
+
 def _print_draft_summary(categorized_data: dict, chats_for_ai: list[dict]) -> None:
     chat_lookup = _build_chat_lookup(chats_for_ai)
     lines, total = build_summary_lines(categorized_data, chat_lookup)
@@ -115,7 +124,12 @@ def _print_draft_summary(categorized_data: dict, chats_for_ai: list[dict]) -> No
 
 
 def _suggest_folder_id(chat: dict, folders: list[dict]) -> int | None:
-    text = f"{chat.get('title', '')} {chat.get('description', '')} {chat.get('last_message', '')}".lower()
+    text = (
+        f"{chat.get('title', '')} "
+        f"{chat.get('description', '')} "
+        f"{chat.get('recent_messages_text', '')} "
+        f"{chat.get('last_message', '')}"
+    ).lower()
     best_id = None
     best_score = 0
     for folder in folders:
@@ -202,7 +216,7 @@ async def _review_unassigned_chats(categorized_data: dict, unassigned_chats: lis
         chat_id = int(chat["chat_id"])
         title = chat.get("title", "未知")
         chat_type = chat.get("type", "UNKNOWN")
-        description = chat.get("description") or chat.get("last_message") or ""
+        description = chat.get("description") or chat.get("recent_messages_text") or chat.get("last_message") or ""
         suggested_folder = _suggest_folder_id(chat, folders)
 
         print("\n" + "-" * 88)
@@ -355,13 +369,24 @@ async def run_cli_wizard() -> None:
             use_cache = bool(await prompt_yes_no(f"发现缓存文件 {files['chats'].name}，是否复用？", default=True))
         if use_cache:
             chats_for_ai = cached_chats
-            dialog_map = await collect_dialog_map(client)
+            if _cache_has_recent_messages(chats_for_ai):
+                dialog_map = await collect_dialog_map(client)
+            else:
+                print("Cached chats are missing recent_messages fields; recollecting from Telegram...")
+                use_cache = False
+                chats_for_ai = []
             print(f"已加载缓存聊天: {len(chats_for_ai)} 条")
         else:
             print("正在从 Telegram 收集聊天详情，这可能需要几分钟...")
             chats_for_ai, dialog_map = await collect_chats_for_ai(client, progress_every=10)
             save_chats_info(chats_for_ai, files["chats"])
             print(f"收集完成并已缓存: {len(chats_for_ai)} 条")
+
+        if not use_cache and not chats_for_ai:
+            print("Cached data was invalid for recent_messages, recollecting from Telegram...")
+            chats_for_ai, dialog_map = await collect_chats_for_ai(client, progress_every=10)
+            save_chats_info(chats_for_ai, files["chats"])
+            print(f"Collected and cached chats: {len(chats_for_ai)}")
 
         if not chats_for_ai:
             print("未找到可分类的群组/频道，流程结束。")

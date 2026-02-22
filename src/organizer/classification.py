@@ -14,9 +14,21 @@ def _truncate(text: str, max_len: int) -> str:
 
 def build_prompts(chats: list[dict], folders: list[dict]) -> tuple[str, str]:
     folder_payload = [{"id": f["id"], "title": f["title"]} for f in folders]
+    folder_title_map = {int(f["id"]): str(f["title"]) for f in folders if f.get("id") is not None}
+    allowed_folder_ids = sorted(folder_title_map.keys())
 
     chat_payload = []
     for chat in chats:
+        recent_messages_raw = chat.get("recent_messages")
+        if not isinstance(recent_messages_raw, list):
+            recent_messages_raw = []
+        recent_messages = [
+            _truncate(str(item), 200)
+            for item in recent_messages_raw
+            if str(item).strip()
+        ][:10]
+        recent_messages_text = chat.get("recent_messages_text") or " | ".join(recent_messages)
+
         chat_payload.append(
             {
                 "chat_id": chat.get("chat_id"),
@@ -25,6 +37,8 @@ def build_prompts(chats: list[dict], folders: list[dict]) -> tuple[str, str]:
                 "username": _truncate(str(chat.get("username", "")), 80),
                 "description": _truncate(str(chat.get("description", "")), 300),
                 "last_message": _truncate(str(chat.get("last_message", "")), 300),
+                "recent_messages": recent_messages,
+                "recent_messages_text": _truncate(str(recent_messages_text), 1200),
                 "participant_count": chat.get("participant_count", 0),
                 "is_verified": bool(chat.get("is_verified", False)),
                 "is_scam": bool(chat.get("is_scam", False)),
@@ -32,20 +46,50 @@ def build_prompts(chats: list[dict], folders: list[dict]) -> tuple[str, str]:
         )
 
     system_prompt = (
-        "你是 Telegram 聊天整理专家。"
-        "请严格输出 JSON，不要输出 markdown 代码块，不要输出解释性文字。"
+        "你是一个高精度 Telegram 文件夹分类器。"
+        "你只输出结构化分类结果，不输出解释文本。\n"
+        "[硬性约束]\n"
+        "1) 只能使用输入中给定的 folder_id 和 folder_title，禁止新增或改写文件夹。\n"
+        "2) 一个 chat_id 最多出现一次；无法高置信判断时，不要输出该 chat_id。\n"
+        "3) 仅输出一个 JSON 对象，不要 markdown、注释、前后缀文本。\n"
+        "4) 输出必须严格匹配结构："
+        '{"categorized":[{"folder_id":123,"folder_title":"名称","chats":[{"chat_id":1,"type":"GROUP","reason":"依据"}]}]}\n'
+        "5) reason 必须简短可核验（建议 8-28 字），并包含证据来源词（title/username/description/recent_messages/last_message）。\n"
+        "6) 必须保持输入 chat.type，不得改写。\n"
+        "7) 不输出空文件夹；若全部不确定，输出 {\"categorized\":[]}。\n"
+        "8) 策略是 precision > recall（宁可少分，不可错分）。\n"
+        "9) 输出前自检：JSON 可解析、folder_id 合法、folder_title 与映射一致、chat_id 无重复。"
     )
 
     user_prompt = (
-        "请根据 folders 与 chats 的语义相关性进行分类。\n"
-        "规则:\n"
-        "1) 一个 chat 只能分配到一个 folder。\n"
-        "2) 仅输出需要新增 chat 的 folder。\n"
-        "3) 不确定时可暂不分类。\n"
-        "4) 必须返回如下 JSON 结构:\n"
-        '{"categorized":[{"folder_id":123,"folder_title":"名称","chats":[{"chat_id":1,"type":"GROUP","reason":"原因"}]}]}\n\n'
+        "请对 chats 执行高精度分类。\n"
+        "[证据优先级（高->低）]\n"
+        "A) title + username（最高）\n"
+        "B) description/about\n"
+        "C) recent_messages + recent_messages_text（最近10条消息的综合主题）\n"
+        "D) last_message（仅补充，不可单点决定）\n"
+        "E) participant_count/is_verified（弱特征，仅平分时使用）\n"
+        "[误判抑制]\n"
+        "1) 名称像技术群，但 recent_messages 主要是招聘/广告 -> 倾向不分类。\n"
+        "2) 转发混杂频道：不要被单条 last_message 误导，优先看 recent_messages 的一致主题。\n"
+        "3) 同名不同语言/地区社区：必须有明确语义证据再分类。\n"
+        "4) is_scam=true 默认不分类，除非多源证据强一致。\n"
+        "[内部打分（用于你自己的判断，不要输出分数）]\n"
+        "+3: title/username 强关键词匹配\n"
+        "+2: description 或 recent_messages 主题一致\n"
+        "-2: 出现明显冲突信号\n"
+        "-3: is_scam=true 且证据不足\n"
+        "仅当“最佳候选总分 >= 4 且至少领先第二候选 2 分”时才分类，否则留空。\n"
+        "[输出要求]\n"
+        "- 只输出 categorized（不要输出未分类列表）\n"
+        "- 不要输出输入中不存在的 folder_id\n"
+        "- reason 使用“证据字段+关键词”格式，例如：title/python + recent_messages/爬虫\n\n"
+        f"allowed_folder_ids={json.dumps(allowed_folder_ids, ensure_ascii=False)}\n"
+        f"folder_id_title_map={json.dumps(folder_title_map, ensure_ascii=False)}\n"
         f"folders={json.dumps(folder_payload, ensure_ascii=False)}\n"
-        f"chats={json.dumps(chat_payload, ensure_ascii=False)}"
+        f"chat_count={len(chat_payload)}\n"
+        f"chats={json.dumps(chat_payload, ensure_ascii=False)}\n"
+        "只返回最终 JSON。"
     )
     return system_prompt, user_prompt
 
