@@ -1,0 +1,18 @@
+# Python cache / artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment / secrets
+.env
+.env.local
+
+# Runtime directories
+data/
+logs/
+sessions/
