@@ -411,14 +411,16 @@ def _peer_identity(peer) -> int | None:
     return None
 
 
-async def clear_existing_folders(client: TelegramClient, existing_folders: list[dict]) -> None:
+async def clear_existing_folders(client: TelegramClient, existing_folders: list[dict]) -> dict:
     logging.info("Clearing existing folders (keeping one chat per folder)...")
+    report = {"cleared": 0, "skipped": 0, "failed": []}
     for folder in existing_folders:
         folder_id = folder.get("id")
         folder_title = folder.get("title", "Unknown")
         existing_peers = folder.get("existing_peers", [])
         if len(existing_peers) <= 1:
             logging.info("Folder '%s' has <=1 chats, skip.", folder_title)
+            report["skipped"] += 1
             continue
 
         try:
@@ -446,11 +448,14 @@ async def clear_existing_folders(client: TelegramClient, existing_folders: list[
             )
             await client(functions.messages.UpdateDialogFilterRequest(id=folder_id, filter=cleared_filter))
             folder["existing_peers"] = kept_peers
+            report["cleared"] += 1
             logging.info("Cleared folder '%s', kept 1 chat", folder_title)
             await asyncio.sleep(0.3)
         except Exception as exc:
+            report["failed"].append({"folder_id": folder_id, "folder_title": folder_title, "error": str(exc)})
             logging.error("Failed clearing folder '%s': %s", folder_title, exc, exc_info=True)
             await asyncio.sleep(1)
+    return report
 
 
 async def update_folders_with_categorization(
@@ -459,9 +464,16 @@ async def update_folders_with_categorization(
     dialog_map: dict[int, Any],
     existing_folders: list[dict],
     folders_were_cleared: bool = False,
-) -> None:
+) -> dict:
     logging.info("Updating folders with categorization results...")
     folder_map = {folder["id"]: folder for folder in existing_folders}
+    report = {
+        "folders_updated": 0,
+        "folders_skipped": 0,
+        "chats_added": 0,
+        "missing_chats": [],
+        "failed_folders": [],
+    }
 
     for folder_update in categorized_data.get("categorized", []):
         folder_id = folder_update.get("folder_id")
@@ -470,6 +482,9 @@ async def update_folders_with_categorization(
         folder = folder_map.get(folder_id)
         if not folder:
             logging.warning("Folder id=%s not found. Skip.", folder_id)
+            report["failed_folders"].append(
+                {"folder_id": folder_id, "folder_title": folder_title, "error": "folder not found"}
+            )
             continue
 
         new_peers = []
@@ -478,33 +493,34 @@ async def update_folders_with_categorization(
                 chat_id = int(chat_item.get("chat_id"))
             except (TypeError, ValueError):
                 logging.warning("Invalid chat_id: %s", chat_item.get("chat_id"))
+                report["missing_chats"].append({"chat_id": chat_item.get("chat_id"), "reason": "invalid chat_id"})
                 continue
             dialog = dialog_map.get(chat_id)
             if not dialog:
                 logging.warning("chat_id=%s not found in dialog map", chat_id)
+                report["missing_chats"].append({"chat_id": chat_id, "reason": "not found in dialog map"})
                 continue
             if dialog.input_entity:
                 new_peers.append(dialog.input_entity)
 
         if not new_peers:
             logging.info("No chats to add for folder '%s'", folder_title)
+            report["folders_skipped"] += 1
             continue
 
         existing_peers = folder.get("existing_peers", [])
-        if folders_were_cleared:
-            peers_to_add = new_peers
-        else:
-            existing_ids = {_peer_identity(peer) for peer in existing_peers}
-            peers_to_add = []
-            for peer in new_peers:
-                peer_id = _peer_identity(peer)
-                if not peer_id or peer_id in existing_ids:
-                    continue
-                peers_to_add.append(peer)
-                existing_ids.add(peer_id)
+        existing_ids = {_peer_identity(peer) for peer in existing_peers}
+        peers_to_add = []
+        for peer in new_peers:
+            peer_id = _peer_identity(peer)
+            if not peer_id or peer_id in existing_ids:
+                continue
+            peers_to_add.append(peer)
+            existing_ids.add(peer_id)
 
         if not peers_to_add:
             logging.info("All target chats already in folder '%s'", folder_title)
+            report["folders_skipped"] += 1
             continue
 
         all_peers = existing_peers + peers_to_add
@@ -534,8 +550,12 @@ async def update_folders_with_categorization(
 
             await client(functions.messages.UpdateDialogFilterRequest(id=folder_id, filter=updated_filter))
             folder["existing_peers"] = all_peers
+            report["folders_updated"] += 1
+            report["chats_added"] += len(peers_to_add)
             logging.info("Updated folder '%s', added %d chats", folder_title, len(peers_to_add))
             await asyncio.sleep(0.5)
         except Exception as exc:
+            report["failed_folders"].append({"folder_id": folder_id, "folder_title": folder_title, "error": str(exc)})
             logging.error("Failed updating folder '%s': %s", folder_title, exc, exc_info=True)
             await asyncio.sleep(1)
+    return report

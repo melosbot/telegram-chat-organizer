@@ -13,7 +13,7 @@ def print_header(title: str) -> None:
 def print_startup_overview(config: AppConfig) -> None:
     active = config.active_provider
     print_header("Telegram Chat Organizer - CLI 向导")
-    print("本次将执行单次向导流程，完成后自动退出。")
+    print("本次会先生成可审核建议，只有最终确认后才会写入 Telegram。")
     print("\n配置摘要（敏感信息已脱敏）:")
     print(f"- SESSION_NAME: {config.telegram.session_name}")
     print(f"- AI_PROVIDER: {config.ai_provider}")
@@ -28,22 +28,26 @@ def print_startup_overview(config: AppConfig) -> None:
     print(f"- LOGS_DIR: {config.paths.logs_dir}")
     print(f"- SESSIONS_DIR: {config.paths.sessions_dir}")
     print("\n流程概览:")
-    print("1) 启动检查")
-    print("2) Telegram 连接检查")
-    print("3) 文件夹策略确认")
-    print("4) 聊天数据准备")
-    print("5) 分类规则说明")
-    print("6) AI 自动分类")
-    print("7) 草稿审阅")
-    print("8) 草稿校验")
-    print("9) 未分类复核")
-    print("10) 两段确认")
-    print("11) 执行并输出报告")
+    print("1) 选择整理目标")
+    print("2) 扫描账号状态")
+    print("3) 补全文件夹说明")
+    print("4) 生成分类建议")
+    print("5) 审核建议")
+    print("6) 执行前预览")
+    print("7) 写入与报告")
 
 
-def print_step(index: int, title: str) -> None:
-    print(f"\n[步骤 {index}/11] {title}")
+def print_step(index: int, title: str, total: int = 7) -> None:
+    print(f"\n[阶段 {index}/{total}] {title}")
     print("-" * 88)
+
+
+def print_target_mode_hint() -> None:
+    print("\n请选择这次整理的目标：")
+    print("- i: 增量补充分组（推荐，不主动清空文件夹）")
+    print("- r: 重新整理全部文件夹（执行前仍会再次确认）")
+    print("- d: 只生成草稿，不写入 Telegram")
+    print("- c: 从已有草稿继续")
 
 
 async def prompt_text(prompt: str, timeout_seconds: int | None = None) -> str | None:
@@ -125,6 +129,32 @@ def print_draft_edit_hint(draft_file: str) -> None:
     print(f"- 文件: {draft_file}")
     print("- 建议先检查每个文件夹新增数量是否合理")
     print("- 再抽查示例聊天是否语义匹配")
+
+
+def print_folder_rules_hint(rules_file: str, missing_description_count: int) -> None:
+    print("\n文件夹说明用于告诉 AI：每个文件夹到底该收什么、不该收什么。")
+    print(f"- 规则文件: {rules_file}")
+    if missing_description_count:
+        print(f"- 当前还有 {missing_description_count} 个文件夹没有说明")
+    else:
+        print("- 当前文件夹说明已填写完整")
+    print("- 你可以只填 description；include_keywords / exclude_keywords / notes 都是可选增强项")
+
+
+def print_folder_rules_summary(lines: list[str]) -> None:
+    print("\n当前文件夹说明摘要：")
+    if not lines:
+        print("- 无可用文件夹说明")
+        return
+    for line in lines:
+        print(line)
+
+
+def print_file_review_hint(review_csv: str, draft_file: str) -> None:
+    print("\n你可以通过文件审核分类建议：")
+    print(f"- 推荐编辑 CSV: {review_csv}")
+    print(f"- 高级用户也可直接编辑 JSON: {draft_file}")
+    print("- CSV 修改后程序会自动读取并重建草稿，不需要再选择 JSON/CSV 来源")
 
 
 def print_manual_fallback_hint(error_message: str, prompt: str) -> None:

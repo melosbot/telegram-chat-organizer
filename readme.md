@@ -8,40 +8,63 @@
 - 单次 CLI 向导流程（`python run.py`）
 - 双 AI Provider：OpenAI / Gemini
 - 官方 SDK 接入（`openai`、`google-genai`）
+- 文件夹说明规则：`data/folder_rules.json`
 - 草稿双通道审核：
   - `data/groups.draft.json`（结构化草稿）
   - `data/classification_review.csv`（表格审核）
-- 两段确认机制：先落盘，再写入 Telegram
+- 文件审核自动应用：修改 CSV 后继续即可重建草稿
+- 执行前预览与两段确认：先落盘，再写入 Telegram
 - 未分类聊天复核（支持逐条和批量归类）
 - 运行文件分目录：`data/`、`logs/`、`sessions/`
 - `.gitignore` 默认屏蔽密钥和运行产物
 
-## 2. 运行流程（11 步）
+## 2. 运行流程（7 个阶段）
 
-1. 启动检查与配置摘要
-2. Session 与 Telegram 连接检查
-3. 读取现有文件夹并选择清空策略
-4. 加载缓存或重新收集聊天信息
-5. 输出分类规则与审阅建议
-6. AI 批次分类
-7. 生成草稿 JSON + 审核 CSV
-8. 选择草稿来源（`json` 或 `csv`）并校验
-9. 未分类聊天复核
-10. 两段确认
-11. 写入 Telegram 并输出报告
+1. 选择整理目标：增量补充、重新整理、只生成草稿、从草稿继续
+2. 扫描账号状态：读取文件夹，加载缓存或重新扫描聊天
+3. 补全文件夹说明：生成/更新 `data/folder_rules.json`
+4. 生成分类建议：AI 按文件夹说明和聊天上下文生成草稿
+5. 审核建议：编辑 CSV/JSON，或在终端处理未分类聊天
+6. 执行前预览：查看每个文件夹将新增多少聊天，再选择增量或重建
+7. 写入与报告：最终确认后写入 Telegram 并输出运行文件路径
 
-## 3. 草稿与审核文件
+## 3. 文件夹说明与审核文件
 
-### 3.1 JSON 草稿
+### 3.1 文件夹说明
+
+- 文件：`data/folder_rules.json`
+- 用途：告诉 AI 每个 Telegram 文件夹的真实含义，减少只看标题造成的误判
+- 程序会根据当前 Telegram 文件夹自动生成模板，并保留你已经写过的说明
+
+示例：
+
+```json
+{
+  "version": 1,
+  "folders": [
+    {
+      "folder_id": 1,
+      "folder_title": "技术",
+      "description": "Python、AI、后端、开源项目相关群组和频道",
+      "include_keywords": ["python", "openai", "github"],
+      "exclude_keywords": ["招聘", "广告", "币圈"],
+      "notes": "偏工程技术，不包含纯资讯频道",
+      "missing_from_telegram": false
+    }
+  ]
+}
+```
+
+### 3.2 JSON 草稿
 
 - 文件：`data/groups.draft.json`
 - 用途：机器可读、结构稳定，便于程序校验
 
-### 3.2 CSV 审核（可直接编辑）
+### 3.3 CSV 审核（可直接编辑）
 
 - 文件：`data/classification_review.csv`
 - 用途：便于在 Excel/WPS/Sheets 中批量审核与修改
-- 程序支持在步骤 8 选择 `csv` 作为草稿来源，直接从 CSV 重建分类结果
+- 文件审核模式下，程序会检测 CSV 是否被修改；修改后继续即可自动重建草稿
 
 CSV 列定义：
 
@@ -51,6 +74,8 @@ CSV 列定义：
 - `chat_id`：聊天 ID
 - `chat_title`：聊天标题
 - `chat_type`：聊天类型（GROUP/CHANNEL/...）
+- `confidence`：AI 置信度（high / medium / low，可空）
+- `evidence`：AI 给出的可核验证据短语
 - `username`：聊天用户名（可空）
 - `reason`：分类原因（可手填）
 
@@ -113,15 +138,15 @@ python run.py
 
 ## 7. CSV 直接分类操作示例
 
-1. 运行到步骤 7，程序生成 `data/classification_review.csv`
+1. 运行到“审核建议”阶段，程序生成 `data/classification_review.csv`
 2. 打开 CSV，修改如下字段：
    - 将未分类行 `status` 改为 `categorized`
    - 填入目标 `folder_id`
    - 可选填写 `reason`
-3. 回到终端，在步骤 8 选择 `csv`
-4. 程序会从 CSV 重建 `groups.draft.json` 并继续校验与执行
+3. 回到终端继续
+4. 程序检测到 CSV 已修改后，会自动重建 `groups.draft.json` 并继续校验
 
-## 8. 未分类复核（步骤 9）
+## 8. 未分类复核
 
 支持命令：
 

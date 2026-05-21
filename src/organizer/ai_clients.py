@@ -49,7 +49,7 @@ class OpenAIRESTError(RuntimeError):
 
 
 class AIClient(Protocol):
-    async def classify(self, chats: list[dict], folders: list[dict]) -> dict: ...
+    async def classify(self, chats: list[dict], folders: list[dict], folder_rules: dict | None = None) -> dict: ...
 
 
 def _build_openai_chat_endpoint(base_url: str) -> str:
@@ -302,8 +302,8 @@ class OpenAIClient(BaseProviderClient):
             return content
         raise OpenAIRESTError("OpenAI REST response does not contain text content.")
 
-    async def classify(self, chats: list[dict], folders: list[dict]) -> dict:
-        system_prompt, user_prompt = build_prompts(chats, folders)
+    async def classify(self, chats: list[dict], folders: list[dict], folder_rules: dict | None = None) -> dict:
+        system_prompt, user_prompt = build_prompts(chats, folders, folder_rules=folder_rules)
         if self._use_rest_fallback:
             response_text = await self._execute_with_retry(
                 "OpenAI",
@@ -442,8 +442,8 @@ class GeminiClient(BaseProviderClient):
 
         raise GeminiRESTError("Gemini REST response does not contain text content.")
 
-    async def classify(self, chats: list[dict], folders: list[dict]) -> dict:
-        system_prompt, user_prompt = build_prompts(chats, folders)
+    async def classify(self, chats: list[dict], folders: list[dict], folder_rules: dict | None = None) -> dict:
+        system_prompt, user_prompt = build_prompts(chats, folders, folder_rules=folder_rules)
 
         if self._use_rest_fallback:
             response_text = await self._execute_with_retry(

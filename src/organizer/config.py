@@ -172,7 +172,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         ai_max_retries=_parse_int("AI_MAX_RETRIES", 3, minimum=1),
         ai_retry_backoff_seconds=_parse_float("AI_RETRY_BACKOFF_SECONDS", 1.0, minimum=0.1),
         ai_confirm_timeout_seconds=_parse_int("AI_CONFIRM_TIMEOUT_SECONDS", 120, minimum=1),
-        ai_batch_size=_parse_int("AI_BATCH_SIZE", 200, minimum=1),
+        ai_batch_size=_parse_int("AI_BATCH_SIZE", 80, minimum=1),
         paths=paths,
     )
 

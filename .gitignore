@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environment
 venv/
@@ -16,3 +21,14 @@ venv/
 data/
 logs/
 sessions/
+
+# Runtime files if created in project root
+chats_info.json
+folders_info.json
+groups.draft.json
+groups.json
+classification_review.csv
+folder_rules.json
+run.log
+*.session
+*.session-journal

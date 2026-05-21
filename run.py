@@ -16,6 +16,7 @@ from organizer.ai_clients import AIClientError, create_ai_client
 from organizer.classification import (
     add_chat_assignment,
     build_categorization_from_review_csv,
+    build_folder_rules_summary_lines,
     build_manual_prompt,
     build_summary_lines,
     compute_unassigned_chats,
@@ -24,18 +25,23 @@ from organizer.classification import (
     merge_categorization_results,
     normalize_groups_data,
     print_detailed_classification_guidance,
+    sync_folder_rules,
     validate_reference_integrity,
 )
 from organizer.cli_flow import (
     print_cache_strategy_hint,
     print_clear_strategy_hint,
     print_draft_edit_hint,
+    print_file_review_hint,
     print_folder_picker,
+    print_folder_rules_hint,
+    print_folder_rules_summary,
     print_folder_summary,
     print_header,
     print_manual_fallback_hint,
     print_startup_overview,
     print_step,
+    print_target_mode_hint,
     print_unassigned_hint,
     prompt_choice,
     prompt_text,
@@ -51,7 +57,6 @@ from organizer.telegram_ops import (
     ensure_session_exists,
     get_existing_folders,
     load_chats_info,
-    load_groups_data,
     save_chats_info,
     save_folders_info,
     save_groups_data,
@@ -69,6 +74,7 @@ def _runtime_files(config):
         "final": data_dir / "groups.json",
         "chats": data_dir / "chats_info.json",
         "folders": data_dir / "folders_info.json",
+        "folder_rules": data_dir / "folder_rules.json",
         "review_csv": data_dir / "classification_review.csv",
         "log": config.paths.logs_dir / "run.log",
     }
@@ -79,6 +85,7 @@ def _migrate_legacy_files(config, files: dict[str, Path]) -> list[str]:
     mapping = {
         PROJECT_ROOT / "chats_info.json": files["chats"],
         PROJECT_ROOT / "folders_info.json": files["folders"],
+        PROJECT_ROOT / "folder_rules.json": files["folder_rules"],
         PROJECT_ROOT / "groups.draft.json": files["draft"],
         PROJECT_ROOT / "groups.json": files["final"],
         PROJECT_ROOT / "classification_review.csv": files["review_csv"],
@@ -141,7 +148,13 @@ def _suggest_folder_id(chat: dict, folders: list[dict]) -> int | None:
     return best_id if best_score > 0 else None
 
 
-async def _classify_with_ai_in_batches(ai_client, chats_for_ai: list[dict], folders: list[dict], batch_size: int) -> dict:
+async def _classify_with_ai_in_batches(
+    ai_client,
+    chats_for_ai: list[dict],
+    folders: list[dict],
+    batch_size: int,
+    folder_rules: dict | None = None,
+) -> dict:
     results = []
     total_batches = max(1, ceil(len(chats_for_ai) / batch_size))
     for index in range(total_batches):
@@ -149,7 +162,7 @@ async def _classify_with_ai_in_batches(ai_client, chats_for_ai: list[dict], fold
         end = start + batch_size
         batch = chats_for_ai[start:end]
         print(f"- 正在执行 AI 分类批次 {index + 1}/{total_batches}，本批 {len(batch)} 条聊天")
-        batch_result = await ai_client.classify(batch, folders)
+        batch_result = await ai_client.classify(batch, folders, folder_rules=folder_rules)
         results.append(batch_result)
 
     folder_lookup = {folder["id"]: folder["title"] for folder in folders}
@@ -167,6 +180,144 @@ def _load_json_with_error(filename: str | Path) -> tuple[dict | None, str | None
         return None, f"JSON 解析失败: {exc}"
     except Exception as exc:  # pragma: no cover - defensive
         return None, f"读取文件失败: {exc}"
+
+
+def _file_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+async def _prepare_folder_rules(rules_file: Path, folders: list[dict]) -> dict:
+    existing_rules, load_error = _load_json_with_error(rules_file)
+    if load_error and rules_file.exists():
+        print(f"文件夹说明读取失败，将生成新模板: {load_error}")
+
+    rules_data = sync_folder_rules(folders, existing_rules)
+    save_json_file(rules_file, rules_data)
+
+    while True:
+        lines, missing_count = build_folder_rules_summary_lines(rules_data, folders)
+        print_folder_rules_hint(str(rules_file), missing_count)
+        action = await prompt_choice(
+            "文件夹说明 [Enter=继续 / e=编辑后继续 / s=查看摘要]: ",
+            allowed={"c", "e", "s"},
+            default="c",
+        )
+        if action == "s":
+            print_folder_rules_summary(lines)
+            continue
+        if action == "e":
+            await wait_for_enter(f"请编辑 {rules_file}，完成后返回终端")
+            reloaded, reload_error = _load_json_with_error(rules_file)
+            if reload_error:
+                print(f"文件夹说明读取失败: {reload_error}")
+                continue
+            rules_data = sync_folder_rules(folders, reloaded)
+            save_json_file(rules_file, rules_data)
+            lines, missing_count = build_folder_rules_summary_lines(rules_data, folders)
+            print_folder_rules_summary(lines)
+            return rules_data
+        return rules_data
+
+
+def _load_continue_draft(files: dict[str, Path]) -> tuple[dict | None, str | None]:
+    for key in ("draft", "final"):
+        path = files[key]
+        data, error = _load_json_with_error(path)
+        if data is None:
+            continue
+        try:
+            return normalize_groups_data(data), str(path)
+        except ValueError as exc:
+            logging.warning("Continue draft invalid: %s (%s)", path, exc)
+            if error:
+                logging.warning("Continue draft load error: %s", error)
+    return None, None
+
+
+async def _apply_review_files(
+    files: dict[str, Path],
+    folders: list[dict],
+    chats_for_ai: list[dict],
+    draft_mtime_before: int | None,
+    csv_mtime_before: int | None,
+    valid_folder_ids: set[int],
+    valid_chat_ids: set[int],
+) -> dict:
+    draft_changed = _file_mtime_ns(files["draft"]) != draft_mtime_before
+    csv_changed = _file_mtime_ns(files["review_csv"]) != csv_mtime_before
+
+    if csv_changed:
+        try:
+            csv_based_data = build_categorization_from_review_csv(
+                csv_file=files["review_csv"],
+                folders=folders,
+                chats_for_ai=chats_for_ai,
+            )
+            save_json_file(files["draft"], csv_based_data)
+            print("检测到审核 CSV 已修改，已根据 CSV 重建草稿 JSON。")
+        except ValueError as exc:
+            print(f"CSV 重建草稿失败，将继续校验 JSON 草稿: {exc}")
+    elif draft_changed:
+        print("检测到 JSON 草稿已修改，将校验 JSON 草稿。")
+    else:
+        print("未检测到审核文件修改，将使用当前草稿继续。")
+
+    return await _validate_draft_loop(files["draft"], valid_folder_ids, valid_chat_ids)
+
+
+def _print_execution_preview(categorized_data: dict, chats_for_ai: list[dict], folders: list[dict]) -> None:
+    folder_lookup = {int(folder["id"]): folder for folder in folders}
+    chat_lookup = _build_chat_lookup(chats_for_ai)
+    total_targets = 0
+
+    print("\n执行前预览：")
+    for folder_item in categorized_data.get("categorized", []):
+        folder_id = int(folder_item.get("folder_id"))
+        folder = folder_lookup.get(folder_id, {})
+        existing_count = len(folder.get("existing_peers", []))
+        chats = folder_item.get("chats", [])
+        total_targets += len(chats)
+        examples = []
+        for chat_item in chats[:3]:
+            chat = chat_lookup.get(int(chat_item.get("chat_id")), {})
+            examples.append(chat.get("title") or str(chat_item.get("chat_id")))
+        example_text = f"；示例: {', '.join(examples)}" if examples else ""
+        print(f"- {folder_item.get('folder_title', folder.get('title', 'Unknown'))}: 当前 {existing_count} 个，建议添加 {len(chats)} 个{example_text}")
+
+    unassigned = compute_unassigned_chats(chats_for_ai, categorized_data)
+    print(f"- 建议写入目标总数: {total_targets}")
+    print(f"- 保持未分类: {len(unassigned)}")
+
+
+def _print_clear_report(report: dict) -> None:
+    print("\n清空结果：")
+    print(f"- 已清空文件夹: {report.get('cleared', 0)}")
+    print(f"- 跳过文件夹: {report.get('skipped', 0)}")
+    failed = report.get("failed", [])
+    if failed:
+        print(f"- 清空失败: {len(failed)}")
+        for item in failed[:5]:
+            print(f"  - {item.get('folder_title')} ({item.get('folder_id')}): {item.get('error')}")
+
+
+def _print_update_report(report: dict) -> None:
+    print("\n写入结果：")
+    print(f"- 成功更新文件夹: {report.get('folders_updated', 0)}")
+    print(f"- 新增聊天: {report.get('chats_added', 0)}")
+    print(f"- 跳过文件夹: {report.get('folders_skipped', 0)}")
+    missing_chats = report.get("missing_chats", [])
+    failed_folders = report.get("failed_folders", [])
+    if missing_chats:
+        print(f"- 未找到或无效聊天: {len(missing_chats)}")
+        for item in missing_chats[:5]:
+            print(f"  - chat_id={item.get('chat_id')}: {item.get('reason')}")
+    if failed_folders:
+        print(f"- 写入失败文件夹: {len(failed_folders)}")
+        for item in failed_folders[:5]:
+            print(f"  - {item.get('folder_title')} ({item.get('folder_id')}): {item.get('error')}")
 
 
 async def _validate_draft_loop(draft_file: Path, valid_folder_ids: set[int], valid_chat_ids: set[int]) -> dict:
@@ -324,11 +475,27 @@ async def run_cli_wizard() -> None:
         for item in moved:
             print(f"- {item}")
 
-    print_step(1, "启动检查")
+    print_step(1, "选择整理目标")
     print_startup_overview(config)
     print("配置校验通过。")
+    print_target_mode_hint()
+    target_mode = await prompt_choice(
+        "整理目标 [Enter=增量补充 / r=重新整理 / d=只生成草稿 / c=从草稿继续]: ",
+        allowed={"i", "r", "d", "c"},
+        default="i",
+    )
+    draft_only = target_mode == "d"
+    prefer_rebuild = target_mode == "r"
+    continue_from_draft = target_mode == "c"
+    mode_labels = {
+        "i": "增量补充分组",
+        "r": "重新整理全部文件夹",
+        "d": "只生成草稿，不写入 Telegram",
+        "c": "从已有草稿继续",
+    }
+    print(f"本次目标: {mode_labels[target_mode]}")
 
-    print_step(2, "会话与连接检查")
+    print_step(2, "扫描账号状态")
     await ensure_session_exists(config.telegram.session_name, config.paths.sessions_dir)
     client = create_client_with_retry(
         api_id=config.telegram.api_id,
@@ -344,35 +511,30 @@ async def run_cli_wizard() -> None:
         print(f"Telegram 连接成功，当前账号: {display_name}")
         logging.info("Connected as %s", display_name)
 
-        print_step(3, "文件夹读取与操作策略")
         folders = await get_existing_folders(client)
         if not folders:
             raise RuntimeError("未读取到任何 Telegram 文件夹，请先手动创建至少一个。")
         save_folders_info(folders, files["folders"])
         print_folder_summary(folders)
-        print_clear_strategy_hint()
-        clear_folders = await prompt_yes_no("是否清空现有文件夹聊天后再分类？", default=False)
-        if clear_folders:
-            print("正在清空文件夹（每个文件夹保留 1 个聊天）...")
-            await clear_existing_folders(client, folders)
-            print("文件夹清空完成。")
-        else:
-            print("将采用增量添加模式。")
 
-        print_step(4, "聊天数据准备")
         print_cache_strategy_hint()
         chats_for_ai = []
         dialog_map = {}
         cached_chats = load_chats_info(files["chats"])
         use_cache = False
         if cached_chats:
-            use_cache = bool(await prompt_yes_no(f"发现缓存文件 {files['chats'].name}，是否复用？", default=True))
+            cache_choice = await prompt_choice(
+                f"发现缓存文件 {files['chats'].name} [Enter=使用缓存 / r=重新扫描]: ",
+                allowed={"c", "r"},
+                default="c",
+            )
+            use_cache = cache_choice == "c"
         if use_cache:
             chats_for_ai = cached_chats
             if _cache_has_recent_messages(chats_for_ai):
                 dialog_map = await collect_dialog_map(client)
             else:
-                print("Cached chats are missing recent_messages fields; recollecting from Telegram...")
+                print("缓存缺少最近消息字段，将重新扫描 Telegram。")
                 use_cache = False
                 chats_for_ai = []
             print(f"已加载缓存聊天: {len(chats_for_ai)} 条")
@@ -383,38 +545,36 @@ async def run_cli_wizard() -> None:
             print(f"收集完成并已缓存: {len(chats_for_ai)} 条")
 
         if not use_cache and not chats_for_ai:
-            print("Cached data was invalid for recent_messages, recollecting from Telegram...")
+            print("缓存不可用，正在重新扫描 Telegram...")
             chats_for_ai, dialog_map = await collect_chats_for_ai(client, progress_every=10)
             save_chats_info(chats_for_ai, files["chats"])
-            print(f"Collected and cached chats: {len(chats_for_ai)}")
+            print(f"收集完成并已缓存: {len(chats_for_ai)}")
 
         if not chats_for_ai:
             print("未找到可分类的群组/频道，流程结束。")
             return
 
-        print_step(5, "分类规则说明")
-        print_detailed_classification_guidance(folders)
-
-        print_step(6, "自动 AI 分类")
         initial_data = None
-        use_existing_groups = False
-        existing_groups = load_groups_data(files["final"])
-        if existing_groups:
-            use_existing_groups = bool(
-                await prompt_yes_no(f"检测到 {files['final'].name}，是否直接作为初始草稿（跳过 AI）？", default=False)
-            )
+        source_path = None
+        if continue_from_draft:
+            initial_data, source_path = _load_continue_draft(files)
 
-        if use_existing_groups:
-            try:
-                initial_data = normalize_groups_data(existing_groups)
-                print(f"已加载 {files['final'].name} 作为初始草稿。")
-            except ValueError as exc:
-                print(f"现有 groups.json 无法直接使用: {exc}")
-                print("将继续执行 AI 自动分类。")
-                use_existing_groups = False
+        print_step(3, "补全文件夹说明")
+        folder_rules = None
+        if initial_data is None:
+            folder_rules = await _prepare_folder_rules(files["folder_rules"], folders)
+            print_detailed_classification_guidance(folders)
+        else:
+            print("已找到可继续的草稿，将跳过文件夹说明补全和 AI 分类。")
+
+        print_step(4, "生成分类建议")
+        if source_path:
+            print(f"已加载已有草稿: {source_path}")
+        elif continue_from_draft:
+            print("未找到可继续的草稿，将重新生成 AI 分类建议。")
 
         updates_paused_for_ai = False
-        if not use_existing_groups:
+        if initial_data is None:
             ai_client = create_ai_client(config)
             try:
                 try:
@@ -429,11 +589,12 @@ async def run_cli_wizard() -> None:
                     chats_for_ai=chats_for_ai,
                     folders=folders,
                     batch_size=config.ai_batch_size,
+                    folder_rules=folder_rules,
                 )
                 print("AI 分类完成，已生成草稿数据。")
             except (AIClientError, ValueError) as exc:
                 logging.error("AI classify failed: %s", exc, exc_info=True)
-                manual_prompt = build_manual_prompt(chats_for_ai, folders)
+                manual_prompt = build_manual_prompt(chats_for_ai, folders, folder_rules=folder_rules)
                 print_manual_fallback_hint(str(exc), manual_prompt)
                 initial_data = create_manual_draft_template()
             finally:
@@ -446,52 +607,53 @@ async def run_cli_wizard() -> None:
 
         save_json_file(files["draft"], initial_data)
         export_classification_review_csv(files["review_csv"], initial_data, chats_for_ai)
+        draft_mtime_before_review = _file_mtime_ns(files["draft"])
+        csv_mtime_before_review = _file_mtime_ns(files["review_csv"])
 
-        print_step(7, "草稿审阅与手动修改")
+        print_step(5, "审核建议")
         _print_draft_summary(initial_data, chats_for_ai)
         print_draft_edit_hint(str(files["draft"]))
-        print(f"已生成审核 CSV: {files['review_csv']}")
-        print("你可以编辑以下任意文件来修正分类：")
-        print(f"- JSON 草稿: {files['draft']}")
-        print(f"- 审核 CSV: {files['review_csv']}")
-        await wait_for_enter("编辑完成后返回终端继续")
-
-        print_step(8, "草稿校验与修复循环")
-        source_choice = await prompt_choice(
-            "校验前请选择草稿来源 [json/csv]（默认 json）: ",
-            allowed={"json", "csv"},
-            default="json",
-        )
-        if source_choice == "csv":
-            try:
-                csv_based_data = build_categorization_from_review_csv(
-                    csv_file=files["review_csv"],
-                    folders=folders,
-                    chats_for_ai=chats_for_ai,
-                )
-                save_json_file(files["draft"], csv_based_data)
-                print("已根据 CSV 重建草稿 JSON。")
-            except ValueError as exc:
-                print(f"CSV 重建草稿失败，将继续使用 JSON 草稿: {exc}")
+        print_file_review_hint(str(files["review_csv"]), str(files["draft"]))
 
         folder_ids = {int(folder["id"]) for folder in folders}
         chat_ids = {int(chat["chat_id"]) for chat in chats_for_ai}
-        validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
-        save_json_file(files["draft"], validated_data)
-        export_classification_review_csv(files["review_csv"], validated_data, chats_for_ai)
-        print("草稿校验通过。")
+        review_mode = await prompt_choice(
+            "审核方式 [Enter=文件审核 / t=终端处理未分类 / s=跳过审核]: ",
+            allowed={"f", "t", "s"},
+            default="f",
+        )
+        if review_mode == "f":
+            await wait_for_enter("请编辑审核文件，完成后返回终端继续")
+            validated_data = await _apply_review_files(
+                files=files,
+                folders=folders,
+                chats_for_ai=chats_for_ai,
+                draft_mtime_before=draft_mtime_before_review,
+                csv_mtime_before=csv_mtime_before_review,
+                valid_folder_ids=folder_ids,
+                valid_chat_ids=chat_ids,
+            )
+            handle_unassigned = await prompt_yes_no("是否继续在终端处理剩余未分类聊天？", default=False)
+            if handle_unassigned:
+                unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
+                validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, folders)
+        elif review_mode == "t":
+            validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
+            unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
+            validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, folders)
+        else:
+            validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
 
-        print_step(9, "未分类聊天复核")
-        unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
-        validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, folders)
         save_json_file(files["draft"], validated_data)
         validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
         save_json_file(files["draft"], validated_data)
         export_classification_review_csv(files["review_csv"], validated_data, chats_for_ai)
-        print("未分类复核完成。")
+        print("审核完成。")
         print(f"审核 CSV 已更新: {files['review_csv']}")
 
-        print_step(10, "两段确认")
+        print_step(6, "执行前预览")
+        _print_draft_summary(validated_data, chats_for_ai)
+        _print_execution_preview(validated_data, chats_for_ai, folders)
         first_confirm = await prompt_yes_no(
             f"确认采用当前草稿并生成 {files['final'].name} 吗？",
             default=False,
@@ -505,6 +667,22 @@ async def run_cli_wizard() -> None:
             raise RuntimeError("写入 groups.json 失败")
         print("groups.json 已更新。")
 
+        if draft_only:
+            print("本次目标是只生成草稿，已跳过 Telegram 写入。")
+            return
+
+        print_clear_strategy_hint()
+        clear_choice = await prompt_choice(
+            "文件夹处理方式 [Enter=增量添加 / r=先清空再重建]: ",
+            allowed={"i", "r"},
+            default="r" if prefer_rebuild else "i",
+        )
+        clear_folders = clear_choice == "r"
+        if clear_folders:
+            print("将先清空现有文件夹聊天，再按当前草稿重建。")
+        else:
+            print("将采用增量添加模式。")
+
         second_confirm = await prompt_yes_no(
             "确认把分类结果写入 Telegram 文件夹吗？",
             default=False,
@@ -514,18 +692,28 @@ async def run_cli_wizard() -> None:
             print("已取消：结果已保存到 groups.json，但未写入 Telegram。")
             return
 
-        print_step(11, "执行更新并输出报告")
-        await update_folders_with_categorization(
+        print_step(7, "写入与报告")
+        if clear_folders:
+            print("正在清空文件夹（每个文件夹保留 1 个聊天）...")
+            clear_report = await clear_existing_folders(client, folders)
+            _print_clear_report(clear_report)
+            print("文件夹清空完成。")
+
+        update_report = await update_folders_with_categorization(
             client=client,
             categorized_data=validated_data,
             dialog_map=dialog_map,
             existing_folders=folders,
             folders_were_cleared=bool(clear_folders),
         )
+        _print_update_report(update_report)
 
         _print_draft_summary(validated_data, chats_for_ai)
         print("\n执行完成：")
-        print("- 已更新 Telegram 文件夹")
+        if update_report.get("failed_folders") or update_report.get("missing_chats"):
+            print("- Telegram 写入已完成，但存在跳过或失败项，请查看上方报告和日志")
+        else:
+            print("- 已更新 Telegram 文件夹")
         print(f"- 草稿文件: {files['draft']}")
         print(f"- 最终结果: {files['final']}")
         print(f"- 审核 CSV: {files['review_csv']}")
