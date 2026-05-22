@@ -23,7 +23,17 @@ def print_startup_overview(config: AppConfig) -> None:
     print(f"- AI_MAX_RETRIES: {config.ai_max_retries}")
     print(f"- AI_RETRY_BACKOFF_SECONDS: {config.ai_retry_backoff_seconds}")
     print(f"- AI_CONFIRM_TIMEOUT_SECONDS: {config.ai_confirm_timeout_seconds}")
+    print(f"- OPENAI_REASONING_EFFORT: {config.openai_reasoning_effort or 'disabled'}")
+    print(f"- OPENAI_VERBOSITY: {config.openai_verbosity or 'disabled'}")
+    print(f"- GEMINI_THINKING_BUDGET: {config.gemini_thinking_budget}")
+    print(f"- GEMINI_INCLUDE_THOUGHTS: {config.gemini_include_thoughts}")
     print(f"- AI_BATCH_SIZE: {config.ai_batch_size}")
+    print(f"- AI_CONCURRENCY: {config.ai_concurrency}")
+    print(f"- TELEGRAM_RECENT_MESSAGE_LIMIT: {config.telegram_recent_message_limit}")
+    print(f"- TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT: {config.telegram_channel_recent_message_limit}")
+    print(f"- TELEGRAM_SCAN_DELAY_SECONDS: {config.telegram_scan_delay_seconds}")
+    print(f"- TELEGRAM_FETCH_FULL_INFO: {config.telegram_fetch_full_info}")
+    print(f"- TELEGRAM_CACHE_SAVE_EVERY: {config.telegram_cache_save_every}")
     print(f"- DATA_DIR: {config.paths.data_dir}")
     print(f"- LOGS_DIR: {config.paths.logs_dir}")
     print(f"- SESSIONS_DIR: {config.paths.sessions_dir}")
@@ -124,11 +134,11 @@ def print_cache_strategy_hint() -> None:
     print("- 重新收集更准确，但耗时更长")
 
 
-def print_draft_edit_hint(draft_file: str) -> None:
-    print("\n草稿已生成，请手动审阅并可直接修改：")
-    print(f"- 文件: {draft_file}")
-    print("- 建议先检查每个文件夹新增数量是否合理")
-    print("- 再抽查示例聊天是否语义匹配")
+def print_draft_edit_hint(review_csv: str, draft_file: str) -> None:
+    print("\n审核文件已生成，默认请编辑 CSV：")
+    print(f"- CSV 审核表: {review_csv}")
+    print(f"- JSON 草稿: {draft_file}（程序校验用，通常不需要手改）")
+    print("- 建议先按 folder_title 分组检查数量，再抽查 description/last_message 是否支持该分类")
 
 
 def print_folder_rules_hint(rules_file: str, missing_description_count: int) -> None:
@@ -151,10 +161,12 @@ def print_folder_rules_summary(lines: list[str]) -> None:
 
 
 def print_file_review_hint(review_csv: str, draft_file: str) -> None:
-    print("\n你可以通过文件审核分类建议：")
-    print(f"- 推荐编辑 CSV: {review_csv}")
-    print(f"- 高级用户也可直接编辑 JSON: {draft_file}")
-    print("- CSV 修改后程序会自动读取并重建草稿，不需要再选择 JSON/CSV 来源")
+    print("\nCSV 审核方式：")
+    print(f"- 打开并编辑: {review_csv}")
+    print("- 归类一行：填 folder_id，或填精确 folder_title；status 可保留 unassigned")
+    print("- 移除一行：清空 folder_id，或把 status 改为 ignore/skip/remove")
+    print(f"- 高级模式仍可直接编辑 JSON: {draft_file}")
+    print("- 返回终端后程序会优先读取已修改的 CSV，并自动重建草稿")
 
 
 def print_manual_fallback_hint(error_message: str, prompt: str) -> None:

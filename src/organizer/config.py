@@ -39,10 +39,20 @@ class AppConfig:
     ai_provider: str
     openai: ProviderConfig
     gemini: ProviderConfig
+    openai_reasoning_effort: str
+    openai_verbosity: str
+    gemini_thinking_budget: int
+    gemini_include_thoughts: bool
     ai_max_retries: int
     ai_retry_backoff_seconds: float
     ai_confirm_timeout_seconds: int
     ai_batch_size: int
+    ai_concurrency: int
+    telegram_recent_message_limit: int
+    telegram_channel_recent_message_limit: int
+    telegram_scan_delay_seconds: float
+    telegram_fetch_full_info: bool
+    telegram_cache_save_every: int
     paths: PathsConfig
 
     @property
@@ -70,6 +80,28 @@ def _parse_float(name: str, default: float, minimum: float = 0.0) -> float:
     if value < minimum:
         raise ConfigError(f"{name} 不能小于 {minimum}，当前值: {value}")
     return value
+
+
+def _parse_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on", "是"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off", "否"}:
+        return False
+    raise ConfigError(f"{name} 必须是布尔值（true/false），当前值: {raw}")
+
+
+def _parse_optional_choice(name: str, default: str, allowed: set[str]) -> str:
+    raw = os.getenv(name, default).strip().lower()
+    if raw in {"", "none", "off", "false", "0", "disable", "disabled"}:
+        return ""
+    if raw not in allowed:
+        options = ", ".join(sorted(allowed))
+        raise ConfigError(f"{name} 可选值: {options}；留空表示禁用，当前值: {raw}")
+    return raw
 
 
 def _normalize_base_url(name: str, value: str) -> str:
@@ -169,10 +201,28 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         ai_provider=ai_provider,
         openai=openai,
         gemini=gemini,
+        openai_reasoning_effort=_parse_optional_choice(
+            "OPENAI_REASONING_EFFORT",
+            "high",
+            {"minimal", "low", "medium", "high"},
+        ),
+        openai_verbosity=_parse_optional_choice(
+            "OPENAI_VERBOSITY",
+            "medium",
+            {"low", "medium", "high"},
+        ),
+        gemini_thinking_budget=_parse_int("GEMINI_THINKING_BUDGET", 2048, minimum=0),
+        gemini_include_thoughts=_parse_bool("GEMINI_INCLUDE_THOUGHTS", False),
         ai_max_retries=_parse_int("AI_MAX_RETRIES", 3, minimum=1),
         ai_retry_backoff_seconds=_parse_float("AI_RETRY_BACKOFF_SECONDS", 1.0, minimum=0.1),
         ai_confirm_timeout_seconds=_parse_int("AI_CONFIRM_TIMEOUT_SECONDS", 120, minimum=1),
         ai_batch_size=_parse_int("AI_BATCH_SIZE", 80, minimum=1),
+        ai_concurrency=_parse_int("AI_CONCURRENCY", 1, minimum=1),
+        telegram_recent_message_limit=_parse_int("TELEGRAM_RECENT_MESSAGE_LIMIT", 0, minimum=0),
+        telegram_channel_recent_message_limit=_parse_int("TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT", 1, minimum=0),
+        telegram_scan_delay_seconds=_parse_float("TELEGRAM_SCAN_DELAY_SECONDS", 1.0, minimum=0.0),
+        telegram_fetch_full_info=_parse_bool("TELEGRAM_FETCH_FULL_INFO", False),
+        telegram_cache_save_every=_parse_int("TELEGRAM_CACHE_SAVE_EVERY", 10, minimum=1),
         paths=paths,
     )
 

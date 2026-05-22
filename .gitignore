@@ -28,6 +28,7 @@ folders_info.json
 groups.draft.json
 groups.json
 classification_review.csv
+classification_memory.csv
 folder_rules.json
 run.log
 *.session

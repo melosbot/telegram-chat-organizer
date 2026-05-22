@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
+import sqlite3
 import sys
+from datetime import datetime
 from math import ceil
 from pathlib import Path
 
@@ -15,13 +18,17 @@ if str(SRC_DIR) not in sys.path:
 from organizer.ai_clients import AIClientError, create_ai_client
 from organizer.classification import (
     add_chat_assignment,
+    build_categorization_from_memory_csv,
     build_categorization_from_review_csv,
     build_folder_rules_summary_lines,
     build_manual_prompt,
     build_summary_lines,
+    compute_assigned_chat_ids,
     compute_unassigned_chats,
     create_manual_draft_template,
+    export_classification_memory_csv,
     export_classification_review_csv,
+    filter_classification_folders,
     merge_categorization_results,
     normalize_groups_data,
     print_detailed_classification_guidance,
@@ -75,9 +82,123 @@ def _runtime_files(config):
         "chats": data_dir / "chats_info.json",
         "folders": data_dir / "folders_info.json",
         "folder_rules": data_dir / "folder_rules.json",
+        "memory": data_dir / "classification_memory.csv",
         "review_csv": data_dir / "classification_review.csv",
         "log": config.paths.logs_dir / "run.log",
     }
+
+
+def _is_database_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_session_run_lock(lock_file: Path) -> dict:
+    try:
+        with lock_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _acquire_session_run_lock(session_name: str, sessions_dir: Path) -> Path:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = sessions_dir / f"{session_name}.run.lock"
+    payload = {
+        "pid": os.getpid(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "session_name": session_name,
+    }
+
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            existing = _read_session_run_lock(lock_file)
+            pid = existing.get("pid")
+            if isinstance(pid, int) and _pid_is_running(pid):
+                created_at = existing.get("created_at", "未知时间")
+                raise RuntimeError(
+                    "当前 session 正在被另一个整理流程使用。\n"
+                    f"- lock: {lock_file}\n"
+                    f"- pid: {pid}\n"
+                    f"- started: {created_at}\n"
+                    "请先结束另一个 python run.py / create_session.py 进程，再重新运行。"
+                )
+            logging.warning("Removing stale session run lock: %s", lock_file)
+            try:
+                lock_file.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return lock_file
+
+    raise RuntimeError(f"无法创建 session 运行锁: {lock_file}")
+
+
+def _release_session_run_lock(lock_file: Path | None) -> None:
+    if lock_file is None:
+        return
+    existing = _read_session_run_lock(lock_file)
+    if existing.get("pid") != os.getpid():
+        return
+    try:
+        lock_file.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logging.warning("Failed to release session run lock %s: %s", lock_file, exc)
+
+
+def _print_session_database_locked_message(session_file: Path) -> None:
+    print("\nTelegram session 数据库被锁定，已停止本次运行。")
+    print(f"- session: {session_file}")
+    print("- 常见原因：另一个 python run.py / create_session.py 正在使用同一个 session，或上一次运行刚异常退出。")
+    print("- 处理方式：关闭另一个终端里的运行进程，等待几秒后重试。")
+    print("- 不建议删除 .session 文件；删除后需要重新登录 Telegram。")
+
+
+async def _start_client_or_report_locked(client, session_file: Path) -> bool:
+    try:
+        await client.start()
+        return True
+    except sqlite3.OperationalError as exc:
+        if not _is_database_locked_error(exc):
+            raise
+        logging.error("Telegram session database is locked during start: %s", exc)
+        _print_session_database_locked_message(session_file)
+        return False
+
+
+async def _safe_disconnect_client(client) -> None:
+    if client is None:
+        return
+    try:
+        await client.disconnect()
+    except sqlite3.OperationalError as exc:
+        if _is_database_locked_error(exc):
+            logging.warning("Skip Telegram disconnect state save because session database is locked: %s", exc)
+            return
+        raise
+    except Exception as exc:
+        logging.warning("Telegram disconnect failed: %s", exc)
 
 
 def _migrate_legacy_files(config, files: dict[str, Path]) -> list[str]:
@@ -86,6 +207,7 @@ def _migrate_legacy_files(config, files: dict[str, Path]) -> list[str]:
         PROJECT_ROOT / "chats_info.json": files["chats"],
         PROJECT_ROOT / "folders_info.json": files["folders"],
         PROJECT_ROOT / "folder_rules.json": files["folder_rules"],
+        PROJECT_ROOT / "classification_memory.csv": files["memory"],
         PROJECT_ROOT / "groups.draft.json": files["draft"],
         PROJECT_ROOT / "groups.json": files["final"],
         PROJECT_ROOT / "classification_review.csv": files["review_csv"],
@@ -153,17 +275,30 @@ async def _classify_with_ai_in_batches(
     chats_for_ai: list[dict],
     folders: list[dict],
     batch_size: int,
+    concurrency: int = 1,
     folder_rules: dict | None = None,
 ) -> dict:
-    results = []
     total_batches = max(1, ceil(len(chats_for_ai) / batch_size))
+    batches = []
     for index in range(total_batches):
         start = index * batch_size
         end = start + batch_size
         batch = chats_for_ai[start:end]
-        print(f"- 正在执行 AI 分类批次 {index + 1}/{total_batches}，本批 {len(batch)} 条聊天")
-        batch_result = await ai_client.classify(batch, folders, folder_rules=folder_rules)
-        results.append(batch_result)
+        batches.append((index, batch))
+
+    effective_concurrency = max(1, min(concurrency, total_batches))
+    print(f"- AI 分类批次总数: {total_batches}，并发数: {effective_concurrency}")
+    semaphore = asyncio.Semaphore(effective_concurrency)
+
+    async def classify_one(index: int, batch: list[dict]) -> tuple[int, dict]:
+        async with semaphore:
+            print(f"- 开始 AI 分类批次 {index + 1}/{total_batches}，本批 {len(batch)} 条聊天")
+            batch_result = await ai_client.classify(batch, folders, folder_rules=folder_rules)
+            print(f"- 完成 AI 分类批次 {index + 1}/{total_batches}")
+            return index, batch_result
+
+    completed = await asyncio.gather(*(classify_one(index, batch) for index, batch in batches))
+    results = [result for _, result in sorted(completed, key=lambda item: item[0])]
 
     folder_lookup = {folder["id"]: folder["title"] for folder in folders}
     return merge_categorization_results(results, folder_lookup)
@@ -496,16 +631,25 @@ async def run_cli_wizard() -> None:
     print(f"本次目标: {mode_labels[target_mode]}")
 
     print_step(2, "扫描账号状态")
-    await ensure_session_exists(config.telegram.session_name, config.paths.sessions_dir)
-    client = create_client_with_retry(
-        api_id=config.telegram.api_id,
-        api_hash=config.telegram.api_hash,
-        session_name=config.telegram.session_name,
-        sessions_dir=config.paths.sessions_dir,
-    )
+    session_lock_file = None
+    client = None
+    try:
+        session_lock_file = _acquire_session_run_lock(config.telegram.session_name, config.paths.sessions_dir)
+    except RuntimeError as exc:
+        print(str(exc))
+        return
 
     try:
-        await client.start()
+        await ensure_session_exists(config.telegram.session_name, config.paths.sessions_dir)
+        client = create_client_with_retry(
+            api_id=config.telegram.api_id,
+            api_hash=config.telegram.api_hash,
+            session_name=config.telegram.session_name,
+            sessions_dir=config.paths.sessions_dir,
+        )
+        session_file = config.paths.sessions_dir / f"{config.telegram.session_name}.session"
+        if not await _start_client_or_report_locked(client, session_file):
+            return
         me = await client.get_me()
         display_name = me.username or me.first_name or str(me.id)
         print(f"Telegram 连接成功，当前账号: {display_name}")
@@ -540,13 +684,31 @@ async def run_cli_wizard() -> None:
             print(f"已加载缓存聊天: {len(chats_for_ai)} 条")
         else:
             print("正在从 Telegram 收集聊天详情，这可能需要几分钟...")
-            chats_for_ai, dialog_map = await collect_chats_for_ai(client, progress_every=10)
+            chats_for_ai, dialog_map = await collect_chats_for_ai(
+                client,
+                progress_every=10,
+                recent_message_limit=config.telegram_recent_message_limit,
+                channel_recent_message_limit=config.telegram_channel_recent_message_limit,
+                scan_delay_seconds=config.telegram_scan_delay_seconds,
+                fetch_full_info=config.telegram_fetch_full_info,
+                partial_save_filename=files["chats"],
+                partial_save_every=config.telegram_cache_save_every,
+            )
             save_chats_info(chats_for_ai, files["chats"])
             print(f"收集完成并已缓存: {len(chats_for_ai)} 条")
 
         if not use_cache and not chats_for_ai:
             print("缓存不可用，正在重新扫描 Telegram...")
-            chats_for_ai, dialog_map = await collect_chats_for_ai(client, progress_every=10)
+            chats_for_ai, dialog_map = await collect_chats_for_ai(
+                client,
+                progress_every=10,
+                recent_message_limit=config.telegram_recent_message_limit,
+                channel_recent_message_limit=config.telegram_channel_recent_message_limit,
+                scan_delay_seconds=config.telegram_scan_delay_seconds,
+                fetch_full_info=config.telegram_fetch_full_info,
+                partial_save_filename=files["chats"],
+                partial_save_every=config.telegram_cache_save_every,
+            )
             save_chats_info(chats_for_ai, files["chats"])
             print(f"收集完成并已缓存: {len(chats_for_ai)}")
 
@@ -560,12 +722,41 @@ async def run_cli_wizard() -> None:
             initial_data, source_path = _load_continue_draft(files)
 
         print_step(3, "补全文件夹说明")
-        folder_rules = None
+        folder_rules = await _prepare_folder_rules(files["folder_rules"], folders)
+        classification_folders = filter_classification_folders(folders, folder_rules)
+        classification_folder_ids = {int(item["id"]) for item in classification_folders}
+        disabled_count = len(folders) - len(classification_folders)
+        if disabled_count:
+            disabled_titles = [
+                str(folder["title"])
+                for folder in folders
+                if int(folder["id"]) not in classification_folder_ids
+            ]
+            print(f"已禁用 {disabled_count} 个分类目标: {', '.join(disabled_titles)}")
+        if not classification_folders:
+            raise RuntimeError("没有可用的分类目标文件夹，请在 folder_rules.json 中启用至少一个文件夹。")
+        print_detailed_classification_guidance(classification_folders)
+        if initial_data is not None:
+            print("已找到可继续的草稿，将跳过 AI 分类，但仍会按启用的文件夹校验草稿。")
+
+        memory_data = create_manual_draft_template()
+        memory_assigned_ids: set[int] = set()
+        ai_candidate_chats = chats_for_ai
         if initial_data is None:
-            folder_rules = await _prepare_folder_rules(files["folder_rules"], folders)
-            print_detailed_classification_guidance(folders)
-        else:
-            print("已找到可继续的草稿，将跳过文件夹说明补全和 AI 分类。")
+            memory_data = build_categorization_from_memory_csv(files["memory"], classification_folders, chats_for_ai)
+            memory_assigned_ids = compute_assigned_chat_ids(memory_data)
+            if memory_assigned_ids:
+                print(f"已读取分类记忆: {len(memory_assigned_ids)} 条，本次将跳过这些聊天的 AI 重新判断。")
+                ai_candidate_chats = []
+                for chat in chats_for_ai:
+                    try:
+                        chat_id = int(chat.get("chat_id"))
+                    except (TypeError, ValueError):
+                        ai_candidate_chats.append(chat)
+                        continue
+                    if chat_id not in memory_assigned_ids:
+                        ai_candidate_chats.append(chat)
+                print(f"需要 AI 新判断的聊天: {len(ai_candidate_chats)} 条")
 
         print_step(4, "生成分类建议")
         if source_path:
@@ -573,37 +764,45 @@ async def run_cli_wizard() -> None:
         elif continue_from_draft:
             print("未找到可继续的草稿，将重新生成 AI 分类建议。")
 
-        updates_paused_for_ai = False
         if initial_data is None:
-            ai_client = create_ai_client(config)
-            try:
+            ai_result = create_manual_draft_template()
+            if ai_candidate_chats:
+                ai_client = create_ai_client(config)
+                updates_paused_for_ai = False
                 try:
-                    await client.set_receive_updates(False)
-                    updates_paused_for_ai = True
-                    logging.info("Paused Telegram live updates during AI classification.")
-                except Exception as exc:
-                    logging.warning("Failed to pause Telegram live updates: %s", exc)
-
-                initial_data = await _classify_with_ai_in_batches(
-                    ai_client=ai_client,
-                    chats_for_ai=chats_for_ai,
-                    folders=folders,
-                    batch_size=config.ai_batch_size,
-                    folder_rules=folder_rules,
-                )
-                print("AI 分类完成，已生成草稿数据。")
-            except (AIClientError, ValueError) as exc:
-                logging.error("AI classify failed: %s", exc, exc_info=True)
-                manual_prompt = build_manual_prompt(chats_for_ai, folders, folder_rules=folder_rules)
-                print_manual_fallback_hint(str(exc), manual_prompt)
-                initial_data = create_manual_draft_template()
-            finally:
-                if updates_paused_for_ai:
                     try:
-                        await client.set_receive_updates(True)
-                        logging.info("Resumed Telegram live updates.")
+                        await client.set_receive_updates(False)
+                        updates_paused_for_ai = True
+                        logging.info("Paused Telegram live updates during AI classification.")
                     except Exception as exc:
-                        logging.warning("Failed to resume Telegram live updates: %s", exc)
+                        logging.warning("Failed to pause Telegram live updates: %s", exc)
+
+                    ai_result = await _classify_with_ai_in_batches(
+                        ai_client=ai_client,
+                        chats_for_ai=ai_candidate_chats,
+                        folders=classification_folders,
+                        batch_size=config.ai_batch_size,
+                        concurrency=config.ai_concurrency,
+                        folder_rules=folder_rules,
+                    )
+                    print("AI 分类完成，已生成草稿数据。")
+                except (AIClientError, ValueError) as exc:
+                    logging.error("AI classify failed: %s", exc, exc_info=True)
+                    manual_prompt = build_manual_prompt(ai_candidate_chats, classification_folders, folder_rules=folder_rules)
+                    print_manual_fallback_hint(str(exc), manual_prompt)
+                    ai_result = create_manual_draft_template()
+                finally:
+                    if updates_paused_for_ai:
+                        try:
+                            await client.set_receive_updates(True)
+                            logging.info("Resumed Telegram live updates.")
+                        except Exception as exc:
+                            logging.warning("Failed to resume Telegram live updates: %s", exc)
+            else:
+                print("所有当前聊天都已命中分类记忆，跳过 AI 分类。")
+
+            folder_lookup = {int(folder["id"]): str(folder["title"]) for folder in classification_folders}
+            initial_data = merge_categorization_results([memory_data, ai_result], folder_lookup)
 
         save_json_file(files["draft"], initial_data)
         export_classification_review_csv(files["review_csv"], initial_data, chats_for_ai)
@@ -612,10 +811,10 @@ async def run_cli_wizard() -> None:
 
         print_step(5, "审核建议")
         _print_draft_summary(initial_data, chats_for_ai)
-        print_draft_edit_hint(str(files["draft"]))
+        print_draft_edit_hint(str(files["review_csv"]), str(files["draft"]))
         print_file_review_hint(str(files["review_csv"]), str(files["draft"]))
 
-        folder_ids = {int(folder["id"]) for folder in folders}
+        folder_ids = {int(folder["id"]) for folder in classification_folders}
         chat_ids = {int(chat["chat_id"]) for chat in chats_for_ai}
         review_mode = await prompt_choice(
             "审核方式 [Enter=文件审核 / t=终端处理未分类 / s=跳过审核]: ",
@@ -623,10 +822,10 @@ async def run_cli_wizard() -> None:
             default="f",
         )
         if review_mode == "f":
-            await wait_for_enter("请编辑审核文件，完成后返回终端继续")
+            await wait_for_enter("请编辑 CSV 审核表，完成后返回终端继续")
             validated_data = await _apply_review_files(
                 files=files,
-                folders=folders,
+                folders=classification_folders,
                 chats_for_ai=chats_for_ai,
                 draft_mtime_before=draft_mtime_before_review,
                 csv_mtime_before=csv_mtime_before_review,
@@ -636,11 +835,11 @@ async def run_cli_wizard() -> None:
             handle_unassigned = await prompt_yes_no("是否继续在终端处理剩余未分类聊天？", default=False)
             if handle_unassigned:
                 unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
-                validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, folders)
+                validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
         elif review_mode == "t":
             validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
             unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
-            validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, folders)
+            validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
         else:
             validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
 
@@ -648,8 +847,10 @@ async def run_cli_wizard() -> None:
         validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
         save_json_file(files["draft"], validated_data)
         export_classification_review_csv(files["review_csv"], validated_data, chats_for_ai)
+        memory_count = export_classification_memory_csv(files["memory"], validated_data, chats_for_ai)
         print("审核完成。")
         print(f"审核 CSV 已更新: {files['review_csv']}")
+        print(f"分类记忆已更新: {files['memory']}（{memory_count} 条）")
 
         print_step(6, "执行前预览")
         _print_draft_summary(validated_data, chats_for_ai)
@@ -695,7 +896,7 @@ async def run_cli_wizard() -> None:
         print_step(7, "写入与报告")
         if clear_folders:
             print("正在清空文件夹（每个文件夹保留 1 个聊天）...")
-            clear_report = await clear_existing_folders(client, folders)
+            clear_report = await clear_existing_folders(client, classification_folders)
             _print_clear_report(clear_report)
             print("文件夹清空完成。")
 
@@ -717,11 +918,13 @@ async def run_cli_wizard() -> None:
         print(f"- 草稿文件: {files['draft']}")
         print(f"- 最终结果: {files['final']}")
         print(f"- 审核 CSV: {files['review_csv']}")
+        print(f"- 分类记忆: {files['memory']}")
         print(f"- 聊天缓存: {files['chats']}")
         print(f"- 文件夹信息: {files['folders']}")
         print(f"- 日志文件: {files['log']}")
     finally:
-        await client.disconnect()
+        await _safe_disconnect_client(client)
+        _release_session_run_lock(session_lock_file)
 
 
 def main() -> None:

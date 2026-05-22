@@ -1,13 +1,14 @@
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.tl import functions, types
 
 RECENT_MESSAGE_LIMIT = 10
@@ -203,6 +204,37 @@ def _flatten_message_text(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def _message_identity_text(value: Any) -> str:
+    text = re.sub(r"^\d{2}-\d{2}\s+\d{2}:\d{2}\s+", "", str(value or ""))
+    text = _flatten_message_text(text).lower()
+    return text
+
+
+def _messages_are_duplicate(left: Any, right: Any) -> bool:
+    left_text = _message_identity_text(left)
+    right_text = _message_identity_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    shorter, longer = sorted((left_text, right_text), key=len)
+    return len(shorter) >= 12 and shorter in longer
+
+
+def _dedupe_message_samples(samples: list[str], last_message: str = "") -> list[str]:
+    deduped = []
+    seen = set()
+    for sample in samples or []:
+        if not sample or _messages_are_duplicate(sample, last_message):
+            continue
+        identity = _message_identity_text(sample)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(sample)
+    return deduped
+
+
 def _extract_message_excerpt(message, max_len: int = RECENT_MESSAGE_CHAR_LIMIT) -> str:
     text = getattr(message, "message", None) or getattr(message, "raw_text", None) or ""
     if text:
@@ -250,6 +282,8 @@ async def get_detailed_chat_info(
     client: TelegramClient,
     dialog,
     recent_message_limit: int = RECENT_MESSAGE_LIMIT,
+    channel_recent_message_limit: int | None = None,
+    fetch_full_info: bool = True,
 ) -> dict:
     entity = dialog.entity
     chat_info = {
@@ -283,7 +317,7 @@ async def get_detailed_chat_info(
         if hasattr(entity, "about") and entity.about:
             chat_info["about"] = entity.about
 
-        if chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
+        if fetch_full_info and chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
             try:
                 if isinstance(entity, types.Channel):
                     full_chat = await client(functions.channels.GetFullChannelRequest(entity))
@@ -302,23 +336,28 @@ async def get_detailed_chat_info(
         if dialog.message:
             message = dialog.message
             if getattr(message, "message", None):
-                chat_info["last_message"] = str(message.message)[:300]
+                chat_info["last_message"] = _flatten_message_text(str(message.message))[:300]
             elif getattr(message, "action", None):
                 chat_info["last_message"] = f"[系统消息: {message.action.__class__.__name__}]"
             if getattr(message, "date", None):
                 chat_info["last_message_date"] = message.date.strftime("%Y-%m-%d %H:%M")
 
-        if chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
+        effective_recent_limit = recent_message_limit
+        if chat_info["type"] == "CHANNEL" and channel_recent_message_limit is not None:
+            effective_recent_limit = channel_recent_message_limit
+
+        if effective_recent_limit > 0 and chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
             recent_messages = await _fetch_recent_message_samples(
                 client=client,
                 entity=entity,
-                limit=recent_message_limit,
+                limit=effective_recent_limit,
             )
             if recent_messages:
-                chat_info["recent_messages"] = recent_messages
-                chat_info["recent_messages_text"] = " || ".join(recent_messages)[:RECENT_CONTEXT_CHAR_LIMIT]
                 if not chat_info["last_message"]:
                     chat_info["last_message"] = recent_messages[0][:300]
+                recent_messages = _dedupe_message_samples(recent_messages, chat_info["last_message"])
+                chat_info["recent_messages"] = recent_messages
+                chat_info["recent_messages_text"] = " || ".join(recent_messages)[:RECENT_CONTEXT_CHAR_LIMIT]
 
         if not chat_info["description"] and chat_info["about"]:
             chat_info["description"] = chat_info["about"]
@@ -337,6 +376,11 @@ async def collect_chats_for_ai(
     client: TelegramClient,
     progress_every: int = 10,
     recent_message_limit: int = RECENT_MESSAGE_LIMIT,
+    channel_recent_message_limit: int | None = None,
+    scan_delay_seconds: float = 0.1,
+    fetch_full_info: bool = True,
+    partial_save_filename: str | Path | None = None,
+    partial_save_every: int = 10,
 ) -> tuple[list[dict], dict[int, Any]]:
     dialogs = await client.get_dialogs()
     dialog_map = {}
@@ -363,12 +407,17 @@ async def collect_chats_for_ai(
                 client=client,
                 dialog=dialog,
                 recent_message_limit=recent_message_limit,
+                channel_recent_message_limit=channel_recent_message_limit,
+                fetch_full_info=fetch_full_info,
             )
             chats_for_ai.append(chat_info)
             processed_count += 1
+            if partial_save_filename and processed_count % partial_save_every == 0:
+                save_chats_info(chats_for_ai, partial_save_filename)
             if processed_count % progress_every == 0:
                 logging.info("Collected %d chats for AI", processed_count)
-            await asyncio.sleep(0.1)
+            if scan_delay_seconds > 0:
+                await asyncio.sleep(scan_delay_seconds)
 
     return chats_for_ai, dialog_map
 
@@ -411,15 +460,33 @@ def _peer_identity(peer) -> int | None:
     return None
 
 
+def _unique_valid_peers(peers: list[Any]) -> list[Any]:
+    unique = []
+    seen = set()
+    for peer in peers or []:
+        peer_id = _peer_identity(peer)
+        if peer_id is None or peer_id in seen:
+            continue
+        seen.add(peer_id)
+        unique.append(peer)
+    return unique
+
+
 async def clear_existing_folders(client: TelegramClient, existing_folders: list[dict]) -> dict:
     logging.info("Clearing existing folders (keeping one chat per folder)...")
     report = {"cleared": 0, "skipped": 0, "failed": []}
     for folder in existing_folders:
         folder_id = folder.get("id")
         folder_title = folder.get("title", "Unknown")
-        existing_peers = folder.get("existing_peers", [])
+        existing_peers = _unique_valid_peers(folder.get("existing_peers", []))
+        if not existing_peers:
+            logging.info("Folder '%s' has no valid include peers, skip clearing.", folder_title)
+            folder["existing_peers"] = []
+            report["skipped"] += 1
+            continue
         if len(existing_peers) <= 1:
             logging.info("Folder '%s' has <=1 chats, skip.", folder_title)
+            folder["existing_peers"] = existing_peers
             report["skipped"] += 1
             continue
 
@@ -451,6 +518,15 @@ async def clear_existing_folders(client: TelegramClient, existing_folders: list[
             report["cleared"] += 1
             logging.info("Cleared folder '%s', kept 1 chat", folder_title)
             await asyncio.sleep(0.3)
+        except errors.FilterIncludeEmptyError as exc:
+            folder["existing_peers"] = []
+            report["skipped"] += 1
+            logging.warning(
+                "Skip clearing folder '%s' because Telegram rejected the kept include peer: %s",
+                folder_title,
+                exc,
+            )
+            await asyncio.sleep(0.5)
         except Exception as exc:
             report["failed"].append({"folder_id": folder_id, "folder_title": folder_title, "error": str(exc)})
             logging.error("Failed clearing folder '%s': %s", folder_title, exc, exc_info=True)
@@ -502,28 +578,32 @@ async def update_folders_with_categorization(
                 continue
             if dialog.input_entity:
                 new_peers.append(dialog.input_entity)
+        new_peers = _unique_valid_peers(new_peers)
 
         if not new_peers:
             logging.info("No chats to add for folder '%s'", folder_title)
             report["folders_skipped"] += 1
             continue
 
-        existing_peers = folder.get("existing_peers", [])
-        existing_ids = {_peer_identity(peer) for peer in existing_peers}
-        peers_to_add = []
-        for peer in new_peers:
-            peer_id = _peer_identity(peer)
-            if not peer_id or peer_id in existing_ids:
-                continue
-            peers_to_add.append(peer)
-            existing_ids.add(peer_id)
+        existing_peers = _unique_valid_peers(folder.get("existing_peers", []))
+        if folders_were_cleared:
+            peers_to_add = new_peers
+            all_peers = new_peers
+        else:
+            existing_ids = {_peer_identity(peer) for peer in existing_peers}
+            peers_to_add = []
+            for peer in new_peers:
+                peer_id = _peer_identity(peer)
+                if not peer_id or peer_id in existing_ids:
+                    continue
+                peers_to_add.append(peer)
+                existing_ids.add(peer_id)
+            all_peers = existing_peers + peers_to_add
 
         if not peers_to_add:
             logging.info("All target chats already in folder '%s'", folder_title)
             report["folders_skipped"] += 1
             continue
-
-        all_peers = existing_peers + peers_to_add
 
         try:
             original_filter = folder.get("filter_obj")
@@ -534,7 +614,7 @@ async def update_folders_with_categorization(
             updated_filter = types.DialogFilter(
                 id=folder_id,
                 title=original_title,
-                pinned_peers=folder.get("pinned_peers", []),
+                pinned_peers=[] if folders_were_cleared else folder.get("pinned_peers", []),
                 include_peers=all_peers,
                 exclude_peers=folder.get("exclude_peers", []),
                 contacts=getattr(original_filter, "contacts", False) if original_filter else False,

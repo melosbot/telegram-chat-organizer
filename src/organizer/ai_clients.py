@@ -152,6 +152,30 @@ def _is_retryable_exception(exc: Exception, status_code: int | None) -> bool:
     return any(token in text for token in transient_signals)
 
 
+def _is_optional_ai_param_rejected(exc: Exception) -> bool:
+    text = str(exc).lower()
+    param_markers = (
+        "reasoning_effort",
+        "reasoning effort",
+        "verbosity",
+        "thinking_config",
+        "thinkingconfig",
+        "thinking budget",
+        "thinkingbudget",
+    )
+    reject_markers = (
+        "unsupported",
+        "not supported",
+        "unknown",
+        "unrecognized",
+        "invalid argument",
+        "invalid field",
+        "unexpected",
+        "not allowed",
+    )
+    return any(marker in text for marker in param_markers) and any(marker in text for marker in reject_markers)
+
+
 async def _run_with_retry(
     func,
     provider_name: str,
@@ -233,15 +257,37 @@ class OpenAIClient(BaseProviderClient):
                 exc,
             )
 
+    def _optional_generation_params(self) -> dict[str, str]:
+        params = {}
+        if self.config.openai_reasoning_effort:
+            params["reasoning_effort"] = self.config.openai_reasoning_effort
+        if self.config.openai_verbosity:
+            params["verbosity"] = self.config.openai_verbosity
+        return params
+
     def _classify_via_sdk(self, system_prompt: str, user_prompt: str) -> str:
-        response = self._sdk_client.chat.completions.create(
-            model=self.model,
-            temperature=0.1,
-            messages=[
+        base_kwargs = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-        )
+        }
+        optional_params = self._optional_generation_params()
+        try:
+            response = self._sdk_client.chat.completions.create(
+                **base_kwargs,
+                **optional_params,
+            )
+        except Exception as exc:
+            if not optional_params or not _is_optional_ai_param_rejected(exc):
+                raise
+            logging.warning(
+                "OpenAI endpoint rejected reasoning/verbosity options, retry without them: %s",
+                exc,
+            )
+            response = self._sdk_client.chat.completions.create(**base_kwargs)
         choices = getattr(response, "choices", None) or []
         if not choices:
             raise OpenAIRESTError("OpenAI SDK response missing choices")
@@ -261,16 +307,7 @@ class OpenAIClient(BaseProviderClient):
             raise OpenAIRESTError("OpenAI SDK response missing message.content")
         return str(content)
 
-    def _classify_via_rest(self, system_prompt: str, user_prompt: str) -> str:
-        endpoint = _build_openai_chat_endpoint(self.base_url)
-        payload = {
-            "model": self.model,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
+    def _post_rest_payload(self, endpoint: str, payload: dict) -> dict:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             endpoint,
@@ -296,6 +333,32 @@ class OpenAIClient(BaseProviderClient):
             payload_json = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise OpenAIRESTError(f"OpenAI REST returned invalid JSON: {exc}") from exc
+
+        return payload_json
+
+    def _classify_via_rest(self, system_prompt: str, user_prompt: str) -> str:
+        endpoint = _build_openai_chat_endpoint(self.base_url)
+        base_payload = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        optional_params = self._optional_generation_params()
+        payload = {**base_payload, **optional_params}
+
+        try:
+            payload_json = self._post_rest_payload(endpoint, payload)
+        except OpenAIRESTError as exc:
+            if not optional_params or exc.code not in {400, 422} or not _is_optional_ai_param_rejected(exc):
+                raise
+            logging.warning(
+                "OpenAI REST endpoint rejected reasoning/verbosity options, retry without them: %s",
+                exc,
+            )
+            payload_json = self._post_rest_payload(endpoint, base_payload)
 
         content = _extract_openai_text(payload_json)
         if content:
@@ -357,23 +420,58 @@ class GeminiClient(BaseProviderClient):
                 http_options={"base_url": self.base_url, "timeout": self.timeout_seconds * 1000},
             )
 
+    def _build_sdk_thinking_config(self):
+        if self.config.gemini_thinking_budget <= 0 or types is None:
+            return None
+        try:
+            return types.ThinkingConfig(
+                thinking_budget=self.config.gemini_thinking_budget,
+                include_thoughts=self.config.gemini_include_thoughts,
+            )
+        except Exception as exc:
+            logging.warning("Gemini SDK thinking config unavailable, continue without it: %s", exc)
+            return None
+
+    def _rest_thinking_config(self) -> dict | None:
+        if self.config.gemini_thinking_budget <= 0:
+            return None
+        return {
+            "thinkingBudget": self.config.gemini_thinking_budget,
+            "includeThoughts": self.config.gemini_include_thoughts,
+        }
+
     def _classify_via_sdk(self, system_prompt: str, user_prompt: str) -> str:
         config_kwargs = {
             "system_instruction": system_prompt,
             "temperature": 0.1,
             "response_mime_type": "application/json",
         }
+        thinking_config = self._build_sdk_thinking_config()
+        if thinking_config is not None:
+            config_kwargs["thinking_config"] = thinking_config
         try:
             config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
         except Exception:
             pass
 
         config = types.GenerateContentConfig(**config_kwargs)
-        response = self._sdk_client.models.generate_content(
-            model=self.model,
-            contents=user_prompt,
-            config=config,
-        )
+        try:
+            response = self._sdk_client.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=config,
+            )
+        except Exception as exc:
+            if "thinking_config" not in config_kwargs or not _is_optional_ai_param_rejected(exc):
+                raise
+            logging.warning("Gemini endpoint rejected thinking config, retry without it: %s", exc)
+            config_kwargs.pop("thinking_config", None)
+            config = types.GenerateContentConfig(**config_kwargs)
+            response = self._sdk_client.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=config,
+            )
 
         content = getattr(response, "text", None)
         if content:
@@ -399,14 +497,41 @@ class GeminiClient(BaseProviderClient):
             model=self.model,
             api_key=self.api_key,
         )
+        generation_config = {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        }
+        thinking_config = self._rest_thinking_config()
+        if thinking_config is not None:
+            generation_config["thinkingConfig"] = thinking_config
+
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": generation_config,
         }
+        try:
+            payload_json = self._post_rest_payload(endpoint, payload)
+        except GeminiRESTError as exc:
+            if thinking_config is None or exc.code not in {400, 422} or not _is_optional_ai_param_rejected(exc):
+                raise
+            logging.warning("Gemini REST endpoint rejected thinking config, retry without it: %s", exc)
+            generation_config.pop("thinkingConfig", None)
+            payload_json = self._post_rest_payload(endpoint, payload)
+
+        content = _extract_gemini_rest_text(payload_json)
+        if content:
+            return content
+
+        prompt_feedback = payload_json.get("promptFeedback")
+        if isinstance(prompt_feedback, dict):
+            reason = prompt_feedback.get("blockReason")
+            if reason:
+                raise GeminiRESTError(f"Gemini REST blocked the prompt: {reason}")
+
+        raise GeminiRESTError("Gemini REST response does not contain text content.")
+
+    def _post_rest_payload(self, endpoint: str, payload: dict) -> dict:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             endpoint,
@@ -414,7 +539,6 @@ class GeminiClient(BaseProviderClient):
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-
         try:
             with request.urlopen(req, timeout=self.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
@@ -430,17 +554,7 @@ class GeminiClient(BaseProviderClient):
         except json.JSONDecodeError as exc:
             raise GeminiRESTError(f"Gemini REST returned invalid JSON: {exc}") from exc
 
-        content = _extract_gemini_rest_text(payload_json)
-        if content:
-            return content
-
-        prompt_feedback = payload_json.get("promptFeedback")
-        if isinstance(prompt_feedback, dict):
-            reason = prompt_feedback.get("blockReason")
-            if reason:
-                raise GeminiRESTError(f"Gemini REST blocked the prompt: {reason}")
-
-        raise GeminiRESTError("Gemini REST response does not contain text content.")
+        return payload_json
 
     async def classify(self, chats: list[dict], folders: list[dict], folder_rules: dict | None = None) -> dict:
         system_prompt, user_prompt = build_prompts(chats, folders, folder_rules=folder_rules)
