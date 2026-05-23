@@ -1,43 +1,171 @@
 # Telegram Chat Organizer
 
-面向个人用户的 Telegram 文件夹整理工具。  
-它通过命令行向导收集聊天元信息，调用内置 AI 生成分类草稿，并支持人工审核后再执行写入，避免“黑盒自动改动”风险。
+> 通过 CLI 向导收集 Telegram 聊天信息，让 AI 生成分类草稿，人工审核后再写入文件夹。
+> 强调"先审后写"，避免黑盒自动改动。
 
-## 1. 功能概览
+---
 
-- 单次 CLI 向导流程（`python run.py`）
-- 双 AI Provider：OpenAI / Gemini
-- 官方 SDK 接入（`openai`、`google-genai`）
-- 文件夹说明规则：`data/folder_rules.json`
-- CSV 优先的草稿审核：
-  - `data/classification_review.csv`（默认人工审核入口）
-  - `data/groups.draft.json`（程序校验用结构化草稿）
-- 分类记忆：`data/classification_memory.csv` 会保存审核后的已分类聊天，下次优先读取，减少重复手工分类
-- 文件审核自动应用：修改 CSV 后继续即可重建草稿
-- 执行前预览与两段确认：先落盘，再写入 Telegram
-- 未分类聊天复核（支持逐条和批量归类）
-- 运行文件分目录：`data/`、`logs/`、`sessions/`
-- `.gitignore` 默认屏蔽密钥和运行产物
+## 目录
 
-## 2. 运行流程（7 个阶段）
+1. [快速开始](#1-快速开始)
+2. [核心流程](#2-核心流程)
+3. [环境变量](#3-环境变量)
+   - [3.1 必填](#31-必填)
+   - [3.2 选填（可调可不调）](#32-选填可调可不调)
+4. [运行产物](#4-运行产物)
+5. [常用操作](#5-常用操作)
+6. [项目结构](#6-项目结构)
+7. [常见问题](#7-常见问题)
+8. [开发与测试](#8-开发与测试)
+9. [许可与责任](#9-许可与责任)
 
-1. 选择整理目标：增量补充、重新整理、只生成草稿、从草稿继续
-2. 扫描账号状态：读取文件夹，加载缓存或重新扫描聊天
-3. 补全文件夹说明：生成/更新 `data/folder_rules.json`
-4. 生成分类建议：AI 按文件夹说明和聊天上下文生成草稿
-5. 审核建议：默认编辑 CSV，或在终端处理未分类聊天
-6. 执行前预览：查看每个文件夹将新增多少聊天，再选择增量或重建
-7. 写入与报告：最终确认后写入 Telegram 并输出运行文件路径
+---
 
-## 3. 文件夹说明与审核文件
+## 1. 快速开始
 
-### 3.1 文件夹说明
+```bash
+# 1. 准备环境
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-- 文件：`data/folder_rules.json`
-- 用途：告诉 AI 每个 Telegram 文件夹的真实含义，减少只看标题造成的误判
-- 程序会根据当前 Telegram 文件夹自动生成模板，并保留你已经写过的说明
+# 2. 配置最少必填项（见 §3.1）
+cp .env.example .env
+# 编辑 .env，至少填好 API_ID / API_HASH / OPENAI_API_KEY 或 GEMINI_API_KEY
 
-示例：
+# 3. 首次登录 Telegram（一次性）
+.venv/bin/python create_session.py
+
+# 4. 运行整理向导
+.venv/bin/python run.py
+```
+
+`create_session.py` 会在 `sessions/<SESSION_NAME>.session` 写入登录态；之后再跑 `run.py` 直接复用，不会再要求验证码。
+
+Windows PowerShell 用户把 `.venv/bin/...` 换成 `.venv\Scripts\...` 即可。
+
+---
+
+## 2. 核心流程
+
+`run.py` 是一个 7 阶段的 CLI 向导，每阶段在终端打印步骤标题，关键节点会停下来等待你确认：
+
+| 阶段 | 名称 | 做什么 | 你需要做什么 |
+|---|---|---|---|
+| 1 | 选择整理目标 | 选模式：增量补充 / 重新整理 / 只生成草稿 / 从已有草稿继续 | 输入 `i` / `r` / `d` / `c`，回车默认 `i` |
+| 2 | 扫描账号状态 | 读取你的 Telegram 文件夹和聊天列表（受 `TELEGRAM_*` 配置控制） | 选择使用缓存或重新扫描 |
+| 3 | 补全文件夹说明 | 把当前 Telegram 文件夹同步到 `data/folder_rules.json`，保留你已写过的说明 | 可选：编辑 `description` / `notes` / `include_keywords` 后回车继续 |
+| 4 | 生成分类建议 | 命中 `classification_memory.csv` 的聊天跳过 AI；其余分批送给 AI（OpenAI 或 Gemini） | 等待 AI 完成；失败批会记录在 `logs/failed_batches.json`，下次可一键重试 |
+| 5 | 审核建议 | 把结果导出到 `data/classification_review.csv`，可在 Excel/Sheets 编辑；也支持终端逐条复核 | **重点环节**：修改 CSV 或终端命令调整结果 |
+| 6 | 执行前预览 | 打印每个文件夹的"当前数量 → 新增数量"对比，并把每条 add/keep/remove 导出 `data/execution_preview.csv` | 检查后确认是否生成 `groups.json` |
+| 7 | 写入与报告 | （可选）先备份再清空旧文件夹，然后写入 Telegram；输出每个文件的最终路径 | 二次确认后执行；可选"增量添加"或"先清空再重建" |
+
+**双重确认机制**：阶段 6 → `groups.json` 落盘；阶段 7 → 真正写入 Telegram。任何一步都可取消，已审核数据保留在 `data/` 目录里。
+
+---
+
+## 3. 环境变量
+
+所有环境变量在 `.env` 中配置（参考 `.env.example`）。
+
+### 3.1 必填
+
+只有 4 项是真正必填的，缺一不可：
+
+| 变量 | 说明 | 获取方式 |
+|---|---|---|
+| `API_ID` | Telegram API ID | https://my.telegram.org → API development tools |
+| `API_HASH` | Telegram API hash | 同上 |
+| `AI_PROVIDER` | `openai` 或 `gemini`，决定下面哪个 key 必填 | 自行选择 |
+| `OPENAI_API_KEY` **或** `GEMINI_API_KEY` | AI 服务密钥，与 `AI_PROVIDER` 对应 | OpenAI 控制台 / Google AI Studio |
+
+只要这 4 项填好就能跑起来——其它变量都有合理默认值。
+
+### 3.2 选填（可调可不调）
+
+按主题分组，按需调整。**保持默认就能用**；下面是你可能想调的场景。
+
+#### 路径与会话
+
+| 变量 | 默认值 | 调整时机 |
+|---|---|---|
+| `SESSION_NAME` | `mili` | 同一项目维护多账号时改名 |
+| `SESSIONS_DIR` | `sessions` | 把 `.session` 文件放到别处 |
+| `DATA_DIR` | `data` | CSV/JSON 产物想放别处 |
+| `LOGS_DIR` | `logs` | 日志想放别处 |
+
+#### AI 调用控制
+
+| 变量 | 默认值 | 调整时机 |
+|---|---|---|
+| `AI_BATCH_SIZE` | `40` | 失败率高时降到 20；账号稳定时可升到 80 |
+| `AI_CONCURRENCY` | `2` | 接口限流严重时降到 1 |
+| `AI_MAX_RETRIES` | `3` | 网络抖动多时升到 5 |
+| `AI_RETRY_BACKOFF_SECONDS` | `1` | 第 N 次重试等 `backoff × 2^(N-1)` 秒 |
+| `AI_CONFIRM_TIMEOUT_SECONDS` | `120` | 关键 y/n 确认的超时秒数 |
+
+#### OpenAI 专属
+
+| 变量 | 默认值 | 调整时机 |
+|---|---|---|
+| `OPENAI_MODEL` | `gpt-4o-mini` | 想换模型时改 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 走自建代理或 Azure 时改 |
+| `OPENAI_TIMEOUT_SECONDS` | `45` | 模型推理慢时升到 90 |
+| `OPENAI_REASONING_EFFORT` | `high` | `minimal` / `low` / `medium` / `high`；不兼容端点会自动降级 |
+| `OPENAI_VERBOSITY` | `medium` | `low` / `medium` / `high`；不兼容端点会自动降级 |
+
+#### Gemini 专属
+
+| 变量 | 默认值 | 调整时机 |
+|---|---|---|
+| `GEMINI_MODEL` | `gemini-2.0-flash` | 想换模型时改 |
+| `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` | 走代理时改 |
+| `GEMINI_TIMEOUT_SECONDS` | `45` | 模型推理慢时升到 90 |
+| `GEMINI_THINKING_BUDGET` | `2048` | `0` 禁用思考 token；想更深推理可升到 4096+ |
+| `GEMINI_INCLUDE_THOUGHTS` | `false` | 是否让 Gemini 返回 thoughts；默认关，仅影响内部预算 |
+
+#### Telegram 扫描调优
+
+| 变量 | 默认值 | 调整时机 |
+|---|---|---|
+| `TELEGRAM_SCAN_CONCURRENCY` | `3` | 频繁 FloodWait 时降到 1 |
+| `TELEGRAM_SCAN_DELAY_SECONDS` | `0.3` | 同上，可适当升到 1.0 |
+| `TELEGRAM_RECENT_MESSAGE_LIMIT` | `0` | 想让 AI 看最近几条消息时升到 5（注意：易被短期话题污染分类） |
+| `TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT` | `1` | 频道辅助判断发布风格的最近消息数 |
+| `TELEGRAM_FETCH_FULL_INFO` | `false` | 想拉取完整简介/成员数时设 `true`（慢且更多 API 调用） |
+| `TELEGRAM_CACHE_SAVE_EVERY` | `10` | 扫描中每 N 条保存一次缓存 |
+
+---
+
+## 4. 运行产物
+
+所有运行产物落在 3 个目录（路径可通过 §3.2 改名）：
+
+```
+data/
+├── chats_info.json              扫描缓存（聊天元信息）
+├── folders_info.json            扫描缓存（Telegram 文件夹）
+├── folder_rules.json            ★ 你编辑的文件夹说明
+├── classification_review.csv    ★ 审核入口（在 Excel 打开编辑）
+├── classification_memory.csv    分类记忆，下次跳过已分类聊天
+├── groups.draft.json            程序校验用的中间草稿
+├── groups.json                  阶段 6 确认后的最终结果
+├── execution_preview.csv        阶段 7 执行前的 add/keep/remove 清单
+└── folder_snapshot_<ts>.json    "清空重建"前的旧文件夹快照（用于回滚）
+
+logs/
+├── run.log                      运行日志（INFO 级别）
+└── failed_batches.json          上次失败的 AI 批次（下次自动询问是否重试）
+
+sessions/
+├── <SESSION_NAME>.session       Telegram 登录态
+└── <SESSION_NAME>.run.lock      运行锁，防止并发跑两次
+```
+
+★ 标记的是**最常需要你打开编辑**的两个文件。
+
+### `data/folder_rules.json`
+
+告诉 AI 每个 Telegram 文件夹的真实含义。最小只需要 `description` 字段：
 
 ```json
 {
@@ -51,182 +179,163 @@
       "include_keywords": ["python", "openai", "github"],
       "exclude_keywords": ["招聘", "广告", "币圈"],
       "notes": "偏工程技术，不包含纯资讯频道",
+      "suggested_keywords": ["python", "ai"],
       "missing_from_telegram": false
     }
   ]
 }
 ```
 
-如果某个 Telegram 文件夹不希望被自动分类或写入，可以设置：
+- `auto_classify: false` — 该文件夹不参与自动分类，"清空重建"也会跳过
+- `suggested_keywords` — 程序自动从已分类聊天的标题里提炼的高频词，**仅供你参考，不参与 AI 提示**
+- `missing_from_telegram: true` — 旧规则保留，但当前 Telegram 已无对应文件夹
 
-```json
-"auto_classify": false
+### `data/classification_review.csv`
+
+阶段 5 的人工审核入口，可在 Excel/Sheets 直接编辑：
+
+| 列 | 含义 |
+|---|---|
+| `status` | `categorized` / `unassigned` |
+| `folder_id` | 目标文件夹 ID（也可只填 `folder_title`） |
+| `folder_title` | 目标文件夹名称 |
+| `chat_id` / `chat_title` / `chat_type` / `username` | 聊天身份字段 |
+| `description` / `last_message` / `recent_messages` | 用于决策的内容 |
+| `confidence` / `evidence` / `reason` | AI 给出的依据，可以人工覆盖 |
+
+**调整方式**：
+- 给未分类行填 `folder_id` → 加入分类
+- 清空 `folder_id`，或把 `status` 改成 `ignore` / `skip` / `remove` → 移除分类
+
+修改保存后回到终端继续，程序会自动重建 `groups.draft.json` 并校验。
+
+### `data/classification_memory.csv`
+
+记忆已经审核过的聊天，下次跳过 AI。带 `chat_signature` 列：当聊天的 title/username/description 发生变化，签名失效，该聊天会重新交给 AI。
+
+想强制让 AI 重新判断某条，删除对应行即可。
+
+---
+
+## 5. 常用操作
+
+### 阶段 1 的四种整理模式
+
+| 模式 | 输入 | 行为 |
+|---|---|---|
+| 增量补充（默认） | `i` 或回车 | 不动现有文件夹成员，只追加新分类 |
+| 重新整理 | `r` | 写入时提示是否清空旧文件夹再重建（带快照备份） |
+| 只生成草稿 | `d` | 走完阶段 6 就停，不写 Telegram |
+| 从草稿继续 | `c` | 跳过扫描 + AI，直接加载 `groups.draft.json` 进入审核 |
+
+### 阶段 5 未分类终端复核命令
+
+| 命令 | 含义 |
+|---|---|
+| `Enter` 或 `i` | 忽略当前聊天 |
+| `m` | 手动指定一个 `folder_id`（之后支持 `all:<folder_id>` 把剩余全部归类） |
+| `b <folder_id> <chat_id,chat_id,...>` | 批量归类指定聊天 |
+| `b <folder_id> all` | 把当前队列剩余聊天全部归到该文件夹 |
+| `s <关键词>` | 在队列中按 title/username/description 过滤 |
+| `r` | 重置过滤，恢复未处理队列 |
+| `g` | 显示当前队列按 chat_type 的分桶数 |
+| `l` | 重新打印文件夹列表 |
+| `q` | 结束复核，剩余保持未分类 |
+| `?` | 重新打印帮助 |
+
+---
+
+## 6. 项目结构
+
 ```
-
-程序不会把聊天自动分到该文件夹；执行“清空重建”时也只会处理启用的分类目标。
-
-### 3.2 CSV 审核（默认编辑）
-
-- 文件：`data/classification_review.csv`
-- 用途：便于在 Excel/WPS/Sheets 中批量审核与修改，是默认人工入口
-- 文件审核模式下，程序会检测 CSV 是否被修改；修改后继续即可自动重建草稿
-- 人工归类未分类行时，可以只填 `folder_id`，或填精确的 `folder_title`
-- 人工移除分类行时，可以清空 `folder_id`，或把 `status` 改为 `ignore` / `skip` / `remove`
-
-CSV 列定义：
-
-- `status`：`categorized` / `unassigned`
-- `folder_id`：目标文件夹 ID（仅 `categorized` 行有效）
-- `folder_title`：目标文件夹名称（展示用途）
-- `chat_id`：聊天 ID
-- `chat_title`：聊天标题
-- `chat_type`：聊天类型（GROUP/CHANNEL/...）
-- `username`：聊天用户名（可空）
-- `description`：群/频道简介摘要
-- `last_message`：频道最后一条消息摘要（如已读取）
-- `recent_messages`：最近消息摘要（如已读取）
-- `confidence`：AI 置信度（high / medium / low，可空）
-- `evidence`：AI 给出的可核验证据短语
-- `reason`：分类原因（可手填）
-
-### 3.3 JSON 草稿
-
-- 文件：`data/groups.draft.json`
-- 用途：机器可读、结构稳定，便于程序校验
-- 通常不需要手工编辑；CSV 修改后会自动重建该文件
-
-### 3.4 分类记忆
-
-- 文件：`data/classification_memory.csv`
-- 用途：保存审核完成后的聊天归类，下次运行时先读取这份记忆，已命中的聊天不再交给 AI 重复判断
-- 记忆 CSV 自带 `chat_signature` 列；如果聊天标题/用户名/描述发生变化，签名会自动失效，该聊天会重新交给 AI 判断
-- 如果想让某个聊天重新交给 AI，删除对应行即可
-- `include_keywords` 更适合放品牌名、项目名、别名和硬边界；主要分类依据仍应写在 `description` 和 `notes`
-- 审核结束后程序会基于已分类聊天的标题，自动在 `folder_rules.json` 每个文件夹下写入 `suggested_keywords`（仅供你编辑时参考，不参与 AI 提示词）
-
-## 4. 目录结构
-
-```text
 telegram-chat-organizer/
-├── run.py
-├── create_session.py
-├── .env.example
-├── .gitignore
-├── requirements.txt
-├── src/
-│   └── organizer/
-│       ├── __init__.py
-│       ├── config.py
-│       ├── ai_clients.py
-│       ├── classification.py
-│       ├── cli_flow.py
-│       └── telegram_ops.py
-├── data/        # JSON / CSV 运行产物
-├── logs/        # run.log
-└── sessions/    # *.session
+├── run.py                   入口：7 阶段 CLI 向导
+├── create_session.py        一次性：生成 .session 登录态
+├── .env / .env.example      环境变量
+├── requirements.txt         运行依赖
+├── requirements-dev.txt     开发依赖（pytest）
+├── pytest.ini               测试配置
+├── README.md
+├── LICENSE
+│
+├── app/                     主代码（按主题分子包）
+│   ├── __init__.py
+│   ├── config.py            .env 加载与校验
+│   ├── ai/
+│   │   └── clients.py       OpenAI / Gemini SDK + REST fallback
+│   ├── classification/      分类核心
+│   │   ├── prompts.py       system / decision rubric / few-shot
+│   │   ├── normalize.py     规范化 AI 输出 / 合并 / 引用校验
+│   │   ├── folder_rules.py  folder_rules.json 同步 + 关键词反哺
+│   │   ├── io_csv.py        review.csv + memory.csv 读写
+│   │   └── _shared.py       内部文本辅助
+│   ├── cli/
+│   │   ├── flow.py          向导步骤、prompt、提示文案
+│   │   └── unassigned_review.py  未分类终端复核
+│   ├── telegram/
+│   │   ├── client.py        Telethon 包装 + 扫描 + 写入
+│   │   └── session_lock.py  防并发的运行锁
+│   ├── runtime/
+│   │   ├── preview.py       执行预览 CSV + 快照
+│   │   └── failed_batches.py 失败批次落盘与读取
+│   └── utils/
+│       └── text.py          文本去重 / 时间戳剥离
+│
+├── tests/                   pytest 测试（40+ 用例）
+├── data/                    JSON / CSV 运行产物（gitignored）
+├── logs/                    运行日志（gitignored）
+└── sessions/                Telegram session（gitignored）
 ```
 
-## 5. 安装与启动
+---
+
+## 7. 常见问题
+
+### 7.1 Gemini / OpenAI 报 400
+
+- 确认 `.env` 是否被正确加载（程序启动时会打印脱敏摘要）
+- 检查 `AI_PROVIDER` 与 `*_API_KEY` 是否匹配
+- 检查 `*_BASE_URL` 与 `*_MODEL` 是否可用
+
+### 7.2 Gemini 报 500
+
+- 通常是服务端瞬时错误或 preview 模型高负载
+- 降低 `AI_BATCH_SIZE`（如 20）减小单批负担
+- 优先用当前账号可用的稳定模型；速度优先时换 flash 系列
+
+### 7.3 Telethon `database is locked`
+
+- 另一个 `python run.py` / `create_session.py` 还在使用同一个 `.session`
+- 程序通过 `sessions/<SESSION_NAME>.run.lock` 防止重复启动
+- 等几秒重试；**不要删 `.session`**，否则要重新登录
+
+### 7.4 启动报"当前 session 正在被另一个整理流程使用"
+
+- 上一次运行异常退出，残留了 run.lock
+- 错误信息里会直接给出可执行的 `rm sessions/<SESSION_NAME>.run.lock`
+- 删除前用 `ps -p <PID>` 确认占用进程确实不存在
+
+### 7.5 上次 AI 分类有失败批次
+
+- 失败批次记录在 `logs/failed_batches.json`，含 `chat_id` 和最后一次错误
+- 下次启动到阶段 4 时，会询问"仅重试上次失败的聊天？"，回车默认是
+- 不想再重试就删 `logs/failed_batches.json`（成功一次后程序也会自动清理）
+
+---
+
+## 8. 开发与测试
 
 ```bash
-python -m venv venv
-# Windows PowerShell
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-copy .env.example .env
-python run.py
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest
 ```
 
-## 6. 配置说明（.env）
+测试覆盖：文本工具、分类规范化、文件夹规则同步、CSV 读写（含签名失效）、AI 响应解析、关键词反哺。运行约 0.1 秒，无外部依赖。
 
-| 变量 | 说明 | 默认值 |
-|---|---|---|
-| `API_ID` | Telegram API ID | 无 |
-| `API_HASH` | Telegram API HASH | 无 |
-| `SESSION_NAME` | Session 名称 | `mili` |
-| `SESSIONS_DIR` | Session 存储目录 | `sessions` |
-| `DATA_DIR` | JSON/CSV 数据目录 | `data` |
-| `LOGS_DIR` | 日志目录 | `logs` |
-| `AI_PROVIDER` | `openai` 或 `gemini` | `openai` |
-| `AI_MAX_RETRIES` | AI 请求最大重试次数 | `3` |
-| `AI_RETRY_BACKOFF_SECONDS` | 重试退避基数 | `1` |
-| `AI_CONFIRM_TIMEOUT_SECONDS` | 关键确认超时（秒） | `120` |
-| `AI_BATCH_SIZE` | 每批聊天数 | `40` |
-| `AI_CONCURRENCY` | AI 分类批次并发数；接口不稳定时建议降到 1-2 | `2` |
-| `OPENAI_REASONING_EFFORT` | OpenAI 推理强度；留空禁用，不兼容时自动降级重试 | `high` |
-| `OPENAI_VERBOSITY` | OpenAI 输出详细度；留空禁用，不兼容时自动降级重试 | `medium` |
-| `GEMINI_THINKING_BUDGET` | Gemini thinking token 预算；`0` 表示禁用 | `2048` |
-| `GEMINI_INCLUDE_THOUGHTS` | 是否请求 Gemini 返回 thoughts；默认关闭，只影响内部思考预算 | `false` |
-| `TELEGRAM_RECENT_MESSAGE_LIMIT` | 每个聊天最多读取最近消息数；默认不读取，避免短期话题污染分类 | `0` |
-| `TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT` | 频道最多读取最近消息数；频道最后一条可辅助判断发布风格 | `1` |
-| `TELEGRAM_SCAN_DELAY_SECONDS` | 扫描每个聊天后的等待秒数 | `0.3` |
-| `TELEGRAM_SCAN_CONCURRENCY` | 扫描时的并发数；FloodWait 频繁时降为 1 | `3` |
-| `TELEGRAM_FETCH_FULL_INFO` | 是否读取频道/群完整简介与人数 | `false` |
-| `TELEGRAM_CACHE_SAVE_EVERY` | 扫描中每多少条保存一次缓存 | `10` |
-| `OPENAI_API_KEY` | OpenAI 密钥 | 无 |
-| `OPENAI_BASE_URL` | OpenAI 端点（可含端口） | `https://api.openai.com/v1` |
-| `OPENAI_MODEL` | OpenAI 模型 | `gpt-4o-mini` |
-| `OPENAI_TIMEOUT_SECONDS` | OpenAI 超时 | `45` |
-| `GEMINI_API_KEY` | Gemini 密钥 | 无 |
-| `GEMINI_BASE_URL` | Gemini 端点（可含端口） | `https://generativelanguage.googleapis.com` |
-| `GEMINI_MODEL` | Gemini 模型 | `gemini-2.0-flash` |
-| `GEMINI_TIMEOUT_SECONDS` | Gemini 超时 | `45` |
+---
 
-## 7. CSV 直接分类操作示例
+## 9. 许可与责任
 
-1. 运行到“审核建议”阶段，程序生成 `data/classification_review.csv`
-2. 打开 CSV，修改如下字段：
-   - 对未分类行填入目标 `folder_id`，`status` 可以保持 `unassigned`
-   - 或填入精确的 `folder_title`
-   - 可选填写 `reason`
-3. 回到终端继续
-4. 程序检测到 CSV 已修改后，会自动重建 `groups.draft.json` 并继续校验
+本项目仅用于个人效率提升。请遵守 Telegram 平台条款及当地法律法规。
 
-## 8. 未分类复核
-
-支持命令：
-
-- `i` 忽略当前聊天
-- `m` 手动归类到某个 `folder_id`
-- `l` 重新查看文件夹列表
-- `q` 结束复核
-- 手动归类时支持 `all:<folder_id>`，将剩余聊天批量归类
-
-## 9. 常见问题
-
-### 9.1 Gemini / OpenAI 报 400
-
-- 先确认 `.env` 是否被正确加载
-- 检查 key 与 provider 是否匹配
-- 检查 `BASE_URL` 与模型名是否可用
-
-### 9.2 Gemini 报 500
-
-- 常见于服务端瞬时错误或 preview 模型高负载
-- 建议降低 `AI_BATCH_SIZE`（如 50~80）
-- 建议优先使用当前账号可用的高质量模型；速度优先时可用 flash 系列
-
-### 9.3 Telethon session database is locked
-
-- 通常是另一个 `python run.py` / `create_session.py` 仍在使用同一个 `sessions/*.session`
-- 程序会创建 `sessions/<SESSION_NAME>.run.lock` 防止同一工具重复打开同一个 session
-- 如果确认没有残留进程，等待几秒后重试；不要直接删除 `.session`，否则需要重新登录 Telegram
-
-### 9.4 启动时报 “当前 session 正在被另一个整理流程使用”
-
-- 通常意味着上一次运行异常退出后没有删除运行锁文件
-- 锁文件路径：`sessions/<SESSION_NAME>.run.lock`，里面记录了占用进程的 PID 和启动时间
-- 程序遇到这种情况会在错误信息里直接打印出可执行的 `rm sessions/<SESSION_NAME>.run.lock`
-- 删锁前先用 `ps -p <PID>` 确认占用的进程确实不存在，避免误杀正常运行
-- `.session` 数据库本体不要删除；只有 `.run.lock` 是安全可删的
-
-### 9.5 上次 AI 分类有失败批次
-
-- 程序在 `logs/failed_batches.json` 记录了失败批次涉及的 chat_id 和最后一次错误
-- 下次启动到“生成分类建议”阶段时，会提示“仅重试上次失败的聊天？”，直接回车即可
-- 若想清空失败记录，删除 `logs/failed_batches.json` 即可（程序在没有失败时也会自动清理）
-
-## 10. 许可与责任
-
-本项目用于个人效率提升。请遵守 Telegram 平台条款及当地法律法规。  
-请在可控范围内使用自动化能力并做好数据备份。
+请在可控范围内使用自动化能力，并对 `data/` 目录做好备份——尤其在使用"清空重建"模式之前。
