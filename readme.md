@@ -210,6 +210,20 @@ python run.py
 - 程序会创建 `sessions/<SESSION_NAME>.run.lock` 防止同一工具重复打开同一个 session
 - 如果确认没有残留进程，等待几秒后重试；不要直接删除 `.session`，否则需要重新登录 Telegram
 
+### 9.4 启动时报 “当前 session 正在被另一个整理流程使用”
+
+- 通常意味着上一次运行异常退出后没有删除运行锁文件
+- 锁文件路径：`sessions/<SESSION_NAME>.run.lock`，里面记录了占用进程的 PID 和启动时间
+- 程序遇到这种情况会在错误信息里直接打印出可执行的 `rm sessions/<SESSION_NAME>.run.lock`
+- 删锁前先用 `ps -p <PID>` 确认占用的进程确实不存在，避免误杀正常运行
+- `.session` 数据库本体不要删除；只有 `.run.lock` 是安全可删的
+
+### 9.5 上次 AI 分类有失败批次
+
+- 程序在 `logs/failed_batches.json` 记录了失败批次涉及的 chat_id 和最后一次错误
+- 下次启动到“生成分类建议”阶段时，会提示“仅重试上次失败的聊天？”，直接回车即可
+- 若想清空失败记录，删除 `logs/failed_batches.json` 即可（程序在没有失败时也会自动清理）
+
 ## 10. 许可与责任
 
 本项目用于个人效率提升。请遵守 Telegram 平台条款及当地法律法规。  
