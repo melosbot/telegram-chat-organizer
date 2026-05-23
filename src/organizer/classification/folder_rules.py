@@ -1,14 +1,44 @@
 """Folder rule synchronisation, filtering, and summary helpers."""
 
+import re
+from collections import Counter
+
 from ._shared import clean_string_list, truncate
 
 
 FOLDER_RULES_VERSION = 1
 
+# Stop words that are too generic to suggest as folder keywords. Kept tiny on
+# purpose: the goal is "suggestions a human can edit", not perfect NLP.
+_SUGGESTED_KEYWORD_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "in",
+    "for",
+    "to",
+    "is",
+    "on",
+    "by",
+    "with",
+    "this",
+    "that",
+    "中国",
+    "official",
+    "channel",
+    "group",
+    "chat",
+    "bot",
+    "news",
+}
+
 
 def _folder_rule_from_existing(folder: dict, existing: dict | None = None, missing: bool = False) -> dict:
     existing = existing or {}
-    return {
+    rule = {
         "folder_id": int(folder["id"]),
         "folder_title": str(folder["title"]),
         "auto_classify": bool(existing.get("auto_classify", True)),
@@ -18,6 +48,10 @@ def _folder_rule_from_existing(folder: dict, existing: dict | None = None, missi
         "notes": str(existing.get("notes", "")).strip(),
         "missing_from_telegram": missing,
     }
+    suggested = clean_string_list(existing.get("suggested_keywords", []))
+    if suggested:
+        rule["suggested_keywords"] = suggested
+    return rule
 
 
 def sync_folder_rules(folders: list[dict], existing_rules: dict | None = None) -> dict:
@@ -42,18 +76,20 @@ def sync_folder_rules(folders: list[dict], existing_rules: dict | None = None) -
     for folder_id, old_rule in existing_by_id.items():
         if folder_id in current_ids:
             continue
-        synced_folders.append(
-            {
-                "folder_id": folder_id,
-                "folder_title": str(old_rule.get("folder_title", "")),
-                "auto_classify": bool(old_rule.get("auto_classify", True)),
-                "description": str(old_rule.get("description", "")).strip(),
-                "include_keywords": clean_string_list(old_rule.get("include_keywords", [])),
-                "exclude_keywords": clean_string_list(old_rule.get("exclude_keywords", [])),
-                "notes": str(old_rule.get("notes", "")).strip(),
-                "missing_from_telegram": True,
-            }
-        )
+        orphan = {
+            "folder_id": folder_id,
+            "folder_title": str(old_rule.get("folder_title", "")),
+            "auto_classify": bool(old_rule.get("auto_classify", True)),
+            "description": str(old_rule.get("description", "")).strip(),
+            "include_keywords": clean_string_list(old_rule.get("include_keywords", [])),
+            "exclude_keywords": clean_string_list(old_rule.get("exclude_keywords", [])),
+            "notes": str(old_rule.get("notes", "")).strip(),
+            "missing_from_telegram": True,
+        }
+        suggested = clean_string_list(old_rule.get("suggested_keywords", []))
+        if suggested:
+            orphan["suggested_keywords"] = suggested
+        synced_folders.append(orphan)
 
     return {"version": FOLDER_RULES_VERSION, "folders": synced_folders}
 
@@ -108,6 +144,94 @@ def build_folder_rules_summary_lines(folder_rules: dict | None, folders: list[di
         suffix = f" ({'；'.join(extras)})" if extras else ""
         lines.append(f"- ID={folder_id} | {folder['title']} | {status} | {detail}{suffix}")
     return lines, missing_description_count
+
+
+def _tokenize_title(title: str) -> list[str]:
+    text = re.sub(r"[^\w一-龥]+", " ", str(title).lower())
+    tokens: list[str] = []
+    for raw in text.split():
+        token = raw.strip()
+        if len(token) < 2:
+            continue
+        if token in _SUGGESTED_KEYWORD_STOPWORDS:
+            continue
+        if token.isdigit():
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def derive_suggested_keywords(
+    folder_rules: dict,
+    categorized_data: dict,
+    chats_for_ai: list[dict],
+    *,
+    max_per_folder: int = 10,
+    min_count: int = 2,
+) -> dict:
+    """Return folder_rules with each folder's ``suggested_keywords`` populated
+    from the high-frequency tokens of chat titles already assigned to it.
+
+    Suggestions are advisory only: the AI prompt uses ``include_keywords``,
+    not this field. Users can copy tokens they like into ``include_keywords``.
+    """
+    chat_lookup = {int(c["chat_id"]): c for c in chats_for_ai if c.get("chat_id") is not None}
+    folder_token_counts: dict[int, Counter] = {}
+    for folder_item in categorized_data.get("categorized", []):
+        try:
+            folder_id = int(folder_item.get("folder_id"))
+        except (TypeError, ValueError):
+            continue
+        counter = folder_token_counts.setdefault(folder_id, Counter())
+        for chat_item in folder_item.get("chats", []):
+            try:
+                chat_id = int(chat_item.get("chat_id"))
+            except (TypeError, ValueError):
+                continue
+            chat = chat_lookup.get(chat_id)
+            if not chat:
+                continue
+            for token in _tokenize_title(chat.get("title", "")):
+                counter[token] += 1
+
+    updated_folders: list[dict] = []
+    for rule in folder_rules.get("folders", []) or []:
+        if not isinstance(rule, dict):
+            updated_folders.append(rule)
+            continue
+        new_rule = dict(rule)
+        try:
+            folder_id = int(rule.get("folder_id"))
+        except (TypeError, ValueError):
+            updated_folders.append(new_rule)
+            continue
+        counter = folder_token_counts.get(folder_id)
+        if not counter:
+            new_rule.pop("suggested_keywords", None)
+            updated_folders.append(new_rule)
+            continue
+
+        existing = {
+            tok.lower()
+            for tok in clean_string_list(rule.get("include_keywords", []))
+            + clean_string_list(rule.get("exclude_keywords", []))
+        }
+        suggestions: list[str] = []
+        for token, count in counter.most_common():
+            if count < min_count:
+                break
+            if token in existing:
+                continue
+            suggestions.append(token)
+            if len(suggestions) >= max_per_folder:
+                break
+        if suggestions:
+            new_rule["suggested_keywords"] = suggestions
+        else:
+            new_rule.pop("suggested_keywords", None)
+        updated_folders.append(new_rule)
+
+    return {"version": folder_rules.get("version", FOLDER_RULES_VERSION), "folders": updated_folders}
 
 
 def print_detailed_classification_guidance(folders: list[dict]) -> None:

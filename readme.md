@@ -99,8 +99,10 @@ CSV 列定义：
 
 - 文件：`data/classification_memory.csv`
 - 用途：保存审核完成后的聊天归类，下次运行时先读取这份记忆，已命中的聊天不再交给 AI 重复判断
+- 记忆 CSV 自带 `chat_signature` 列；如果聊天标题/用户名/描述发生变化，签名会自动失效，该聊天会重新交给 AI 判断
 - 如果想让某个聊天重新交给 AI，删除对应行即可
 - `include_keywords` 更适合放品牌名、项目名、别名和硬边界；主要分类依据仍应写在 `description` 和 `notes`
+- 审核结束后程序会基于已分类聊天的标题，自动在 `folder_rules.json` 每个文件夹下写入 `suggested_keywords`（仅供你编辑时参考，不参与 AI 提示词）
 
 ## 4. 目录结构
 

@@ -20,6 +20,7 @@ from organizer.classification import (
     compute_assigned_chat_ids,
     compute_unassigned_chats,
     create_manual_draft_template,
+    derive_suggested_keywords,
     export_classification_memory_csv,
     export_classification_review_csv,
     filter_classification_folders,
@@ -670,9 +671,13 @@ async def run_cli_wizard() -> None:
         save_json_file(files["draft"], validated_data)
         export_classification_review_csv(files["review_csv"], validated_data, chats_for_ai)
         memory_count = export_classification_memory_csv(files["memory"], validated_data, chats_for_ai)
+        refreshed_rules = derive_suggested_keywords(folder_rules, validated_data, chats_for_ai)
+        save_json_file(files["folder_rules"], refreshed_rules)
+        folder_rules = refreshed_rules
         print("审核完成。")
         print(f"审核 CSV 已更新: {files['review_csv']}")
         print(f"分类记忆已更新: {files['memory']}（{memory_count} 条）")
+        print(f"文件夹说明已更新 suggested_keywords: {files['folder_rules']}")
 
         print_step(6, "执行前预览")
         print_draft_summary(validated_data, chats_for_ai)
