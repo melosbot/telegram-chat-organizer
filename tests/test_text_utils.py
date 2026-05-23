@@ -1,4 +1,4 @@
-from organizer.utils.text import (
+from app.utils.text import (
     dedupe_message_samples,
     flatten_message_text,
     message_identity_text,

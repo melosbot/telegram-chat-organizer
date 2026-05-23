@@ -1,6 +1,6 @@
 import csv
 
-from organizer.classification import (
+from app.classification import (
     build_categorization_from_memory_csv,
     build_categorization_from_review_csv,
     compute_chat_signature,

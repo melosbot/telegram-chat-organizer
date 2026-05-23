@@ -3,8 +3,8 @@
 import re
 from collections import Counter
 
-from .classification import add_chat_assignment
-from .cli_flow import print_folder_picker, print_unassigned_hint, prompt_text, prompt_yes_no
+from ..classification import add_chat_assignment
+from .flow import print_folder_picker, print_unassigned_hint, prompt_text, prompt_yes_no
 
 
 def _chat_haystack(chat: dict) -> str:

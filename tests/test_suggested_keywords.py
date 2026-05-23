@@ -1,4 +1,4 @@
-from organizer.classification import (
+from app.classification import (
     derive_suggested_keywords,
     sync_folder_rules,
 )

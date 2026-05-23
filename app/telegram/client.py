@@ -10,7 +10,7 @@ from typing import Any
 from telethon import TelegramClient, errors
 from telethon.tl import functions, types
 
-from .utils.text import dedupe_message_samples, flatten_message_text
+from ..utils.text import dedupe_message_samples, flatten_message_text
 
 RECENT_MESSAGE_LIMIT = 10
 RECENT_MESSAGE_CHAR_LIMIT = 220

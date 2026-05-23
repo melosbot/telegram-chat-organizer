@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from .classification import compute_unassigned_chats
+from ..classification import compute_unassigned_chats
 
 
 def build_chat_lookup(chats_for_ai: list[dict]) -> dict[int, dict]:
@@ -131,7 +131,7 @@ def export_execution_preview_csv(
 
 
 def print_draft_summary(categorized_data: dict, chats_for_ai: list[dict]) -> None:
-    from .classification import build_summary_lines
+    from ..classification import build_summary_lines
 
     chat_lookup = build_chat_lookup(chats_for_ai)
     lines, total = build_summary_lines(categorized_data, chat_lookup)

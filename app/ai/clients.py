@@ -6,8 +6,8 @@ from typing import Any, Protocol
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
-from .classification import build_prompts, parse_ai_response_to_groups
-from .config import AppConfig
+from ..classification import build_prompts, parse_ai_response_to_groups
+from ..config import AppConfig
 
 try:
     from google import genai

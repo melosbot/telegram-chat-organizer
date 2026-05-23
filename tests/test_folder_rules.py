@@ -1,4 +1,4 @@
-from organizer.classification import (
+from app.classification import (
     active_folder_rules_map,
     build_folder_rules_summary_lines,
     filter_classification_folders,

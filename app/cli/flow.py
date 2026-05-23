@@ -1,7 +1,7 @@
 import asyncio
 from typing import Iterable
 
-from .config import AppConfig, mask_secret
+from ..config import AppConfig, mask_secret
 
 
 def print_header(title: str) -> None:

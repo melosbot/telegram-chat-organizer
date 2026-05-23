@@ -1,6 +1,6 @@
 import pytest
 
-from organizer.classification import (
+from app.classification import (
     add_chat_assignment,
     compute_assigned_chat_ids,
     compute_unassigned_chats,

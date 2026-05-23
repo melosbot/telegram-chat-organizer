@@ -1,18 +1,14 @@
 import asyncio
 import logging
 import shutil
-import sys
 from math import ceil
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
-from organizer.ai_clients import AIClientError, create_ai_client
-from organizer.classification import (
+from app.ai.clients import AIClientError, create_ai_client
+from app.classification import (
     build_categorization_from_memory_csv,
     build_categorization_from_review_csv,
     build_folder_rules_summary_lines,
@@ -30,7 +26,7 @@ from organizer.classification import (
     sync_folder_rules,
     validate_reference_integrity,
 )
-from organizer.cli_flow import (
+from app.cli.flow import (
     print_cache_strategy_hint,
     print_clear_strategy_hint,
     print_draft_edit_hint,
@@ -47,13 +43,14 @@ from organizer.cli_flow import (
     prompt_yes_no,
     wait_for_enter,
 )
-from organizer.config import ConfigError, ensure_runtime_dirs, load_config
-from organizer.failed_batches import (
+from app.cli.unassigned_review import review_unassigned_chats
+from app.config import ConfigError, ensure_runtime_dirs, load_config
+from app.runtime.failed_batches import (
     clear_failed_batches,
     load_failed_batches_chat_ids,
     save_failed_batches,
 )
-from organizer.preview import (
+from app.runtime.preview import (
     export_execution_preview_csv,
     print_clear_report,
     print_draft_summary,
@@ -61,13 +58,7 @@ from organizer.preview import (
     print_update_report,
     snapshot_folders,
 )
-from organizer.session_lock import (
-    acquire_session_run_lock,
-    release_session_run_lock,
-    safe_disconnect_client,
-    start_client_or_report_locked,
-)
-from organizer.telegram_ops import (
+from app.telegram.client import (
     clear_existing_folders,
     collect_chats_for_ai,
     create_client_with_retry,
@@ -82,7 +73,12 @@ from organizer.telegram_ops import (
     update_folders_with_categorization,
     validate_groups_json,
 )
-from organizer.unassigned_review import review_unassigned_chats
+from app.telegram.session_lock import (
+    acquire_session_run_lock,
+    release_session_run_lock,
+    safe_disconnect_client,
+    start_client_or_report_locked,
+)
 
 
 def _runtime_files(config):

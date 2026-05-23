@@ -1,4 +1,4 @@
-from organizer.classification import parse_ai_response_to_groups
+from app.classification import parse_ai_response_to_groups
 import pytest
 
 
