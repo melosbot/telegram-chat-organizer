@@ -149,15 +149,16 @@ python run.py
 | `AI_MAX_RETRIES` | AI 请求最大重试次数 | `3` |
 | `AI_RETRY_BACKOFF_SECONDS` | 重试退避基数 | `1` |
 | `AI_CONFIRM_TIMEOUT_SECONDS` | 关键确认超时（秒） | `120` |
-| `AI_BATCH_SIZE` | 每批聊天数 | `80` |
-| `AI_CONCURRENCY` | AI 分类批次并发数；接口不稳定时建议降到 1-2 | `1` |
+| `AI_BATCH_SIZE` | 每批聊天数 | `40` |
+| `AI_CONCURRENCY` | AI 分类批次并发数；接口不稳定时建议降到 1-2 | `2` |
 | `OPENAI_REASONING_EFFORT` | OpenAI 推理强度；留空禁用，不兼容时自动降级重试 | `high` |
 | `OPENAI_VERBOSITY` | OpenAI 输出详细度；留空禁用，不兼容时自动降级重试 | `medium` |
 | `GEMINI_THINKING_BUDGET` | Gemini thinking token 预算；`0` 表示禁用 | `2048` |
 | `GEMINI_INCLUDE_THOUGHTS` | 是否请求 Gemini 返回 thoughts；默认关闭，只影响内部思考预算 | `false` |
 | `TELEGRAM_RECENT_MESSAGE_LIMIT` | 每个聊天最多读取最近消息数；默认不读取，避免短期话题污染分类 | `0` |
 | `TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT` | 频道最多读取最近消息数；频道最后一条可辅助判断发布风格 | `1` |
-| `TELEGRAM_SCAN_DELAY_SECONDS` | 扫描每个聊天后的等待秒数 | `1` |
+| `TELEGRAM_SCAN_DELAY_SECONDS` | 扫描每个聊天后的等待秒数 | `0.3` |
+| `TELEGRAM_SCAN_CONCURRENCY` | 扫描时的并发数；FloodWait 频繁时降为 1 | `3` |
 | `TELEGRAM_FETCH_FULL_INFO` | 是否读取频道/群完整简介与人数 | `false` |
 | `TELEGRAM_CACHE_SAVE_EVERY` | 扫描中每多少条保存一次缓存 | `10` |
 | `OPENAI_API_KEY` | OpenAI 密钥 | 无 |
