@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import re
 from collections import OrderedDict
@@ -20,11 +21,29 @@ CLASSIFICATION_MEMORY_COLUMNS = [
     "chat_type",
     "username",
     "description",
+    "chat_signature",
     "confidence",
     "evidence",
     "reason",
     "updated_at",
 ]
+
+
+def compute_chat_signature(chat: dict) -> str:
+    """Stable fingerprint of a chat's identifying surface used for memory invalidation.
+
+    A change in title / username / description / about means the chat
+    likely shifted topic and the memorised classification should be
+    re-validated by AI.
+    """
+    parts = [
+        str(chat.get("title", "")).strip().lower(),
+        str(chat.get("username", "")).strip().lower(),
+        re.sub(r"\s+", " ", str(chat.get("description", "")).strip().lower())[:400],
+        re.sub(r"\s+", " ", str(chat.get("about", "")).strip().lower())[:400],
+    ]
+    raw = "|".join(parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -672,10 +691,20 @@ def build_categorization_from_memory_csv(
     csv_file: str | Path,
     folders: list[dict],
     chats_for_ai: list[dict],
-) -> dict:
+) -> tuple[dict, dict]:
+    """Return (categorized_data, stats).
+
+    stats keys:
+    - hit: rows whose signature still matches the current chat
+    - changed: rows skipped because the chat signature changed
+    - missing_chat: rows skipped because the chat is no longer present
+    - legacy_no_signature: rows accepted but with no signature recorded
+      (likely produced by an older release; will be rewritten on save)
+    """
     path = Path(csv_file)
+    stats = {"hit": 0, "changed": 0, "missing_chat": 0, "legacy_no_signature": 0}
     if not path.exists():
-        return {"categorized": []}
+        return {"categorized": []}, stats
 
     folder_lookup = {int(folder["id"]): folder["title"] for folder in folders}
     folder_title_lookup = {str(folder["title"]).strip().lower(): int(folder["id"]) for folder in folders}
@@ -686,7 +715,8 @@ def build_categorization_from_memory_csv(
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or "chat_id" not in reader.fieldnames:
-            return {"categorized": []}
+            return {"categorized": []}, stats
+        has_signature_column = "chat_signature" in reader.fieldnames
 
         for row in reader:
             status = str(row.get("status", "")).strip().lower()
@@ -697,7 +727,10 @@ def build_categorization_from_memory_csv(
                 chat_id = int(str(row.get("chat_id", "")).strip())
             except ValueError:
                 continue
-            if chat_id not in chat_lookup or chat_id in seen_chat_ids:
+            if chat_id in seen_chat_ids:
+                continue
+            if chat_id not in chat_lookup:
+                stats["missing_chat"] += 1
                 continue
 
             folder_id = None
@@ -714,8 +747,18 @@ def build_categorization_from_memory_csv(
             if folder_id is None or folder_id not in folder_lookup:
                 continue
 
-            seen_chat_ids.add(chat_id)
             chat = chat_lookup[chat_id]
+            stored_signature = str(row.get("chat_signature", "")).strip() if has_signature_column else ""
+            current_signature = compute_chat_signature(chat)
+            if stored_signature:
+                if stored_signature != current_signature:
+                    stats["changed"] += 1
+                    continue
+                stats["hit"] += 1
+            else:
+                stats["legacy_no_signature"] += 1
+
+            seen_chat_ids.add(chat_id)
             chat_type = str(row.get("chat_type", "")).strip() or str(chat.get("type", "UNKNOWN"))
             confidence = str(row.get("confidence", "")).strip().lower() or "manual"
             reason = str(row.get("reason", "")).strip() or "分类记忆"
@@ -738,7 +781,7 @@ def build_categorization_from_memory_csv(
                 chat_item["evidence"] = evidence[:3]
             categorized_map[folder_id]["chats"].append(chat_item)
 
-    return {"categorized": list(categorized_map.values())}
+    return {"categorized": list(categorized_map.values())}, stats
 
 
 def export_classification_memory_csv(
@@ -794,6 +837,7 @@ def export_classification_memory_csv(
                     "chat_type": chat_item.get("type", chat.get("type", "")),
                     "username": chat.get("username", ""),
                     "description": _csv_context_text(chat.get("description", ""), 500),
+                    "chat_signature": compute_chat_signature(chat),
                     "confidence": chat_item.get("confidence", "manual") or "manual",
                     "evidence": " | ".join(_clean_string_list(chat_item.get("evidence", []))),
                     "reason": chat_item.get("reason", "") or "审核确认分类",

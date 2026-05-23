@@ -1063,8 +1063,22 @@ async def run_cli_wizard() -> None:
         memory_assigned_ids: set[int] = set()
         ai_candidate_chats = chats_for_ai
         if initial_data is None:
-            memory_data = build_categorization_from_memory_csv(files["memory"], classification_folders, chats_for_ai)
+            memory_data, memory_stats = build_categorization_from_memory_csv(
+                files["memory"], classification_folders, chats_for_ai
+            )
             memory_assigned_ids = compute_assigned_chat_ids(memory_data)
+            if memory_stats.get("changed") or memory_stats.get("missing_chat") or memory_stats.get("legacy_no_signature"):
+                print(
+                    "分类记忆统计："
+                    f" 命中={memory_stats.get('hit', 0)}"
+                    f" 签名变化={memory_stats.get('changed', 0)}"
+                    f" 聊天缺失={memory_stats.get('missing_chat', 0)}"
+                    f" 旧记忆无签名={memory_stats.get('legacy_no_signature', 0)}"
+                )
+                if memory_stats.get("changed"):
+                    print("- 签名变化的聊天将重新交给 AI 判断（title/username/description 已变更）")
+                if memory_stats.get("legacy_no_signature"):
+                    print("- 旧记录暂按原分类信任，保存时会自动补全签名")
             if memory_assigned_ids:
                 print(f"已读取分类记忆: {len(memory_assigned_ids)} 条，本次将跳过这些聊天的 AI 重新判断。")
                 ai_candidate_chats = []
