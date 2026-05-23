@@ -1,14 +1,7 @@
 import asyncio
-import csv
-import json
 import logging
-import os
-import re
 import shutil
-import sqlite3
 import sys
-from collections import Counter
-from datetime import datetime
 from math import ceil
 from pathlib import Path
 
@@ -20,12 +13,10 @@ if str(SRC_DIR) not in sys.path:
 
 from organizer.ai_clients import AIClientError, create_ai_client
 from organizer.classification import (
-    add_chat_assignment,
     build_categorization_from_memory_csv,
     build_categorization_from_review_csv,
     build_folder_rules_summary_lines,
     build_manual_prompt,
-    build_summary_lines,
     compute_assigned_chat_ids,
     compute_unassigned_chats,
     create_manual_draft_template,
@@ -43,7 +34,6 @@ from organizer.cli_flow import (
     print_clear_strategy_hint,
     print_draft_edit_hint,
     print_file_review_hint,
-    print_folder_picker,
     print_folder_rules_hint,
     print_folder_rules_summary,
     print_folder_summary,
@@ -52,17 +42,33 @@ from organizer.cli_flow import (
     print_startup_overview,
     print_step,
     print_target_mode_hint,
-    print_unassigned_hint,
     prompt_choice,
-    prompt_text,
     prompt_yes_no,
     wait_for_enter,
 )
 from organizer.config import ConfigError, ensure_runtime_dirs, load_config
+from organizer.failed_batches import (
+    clear_failed_batches,
+    load_failed_batches_chat_ids,
+    save_failed_batches,
+)
+from organizer.preview import (
+    export_execution_preview_csv,
+    print_clear_report,
+    print_draft_summary,
+    print_execution_preview,
+    print_update_report,
+    snapshot_folders,
+)
+from organizer.session_lock import (
+    acquire_session_run_lock,
+    release_session_run_lock,
+    safe_disconnect_client,
+    start_client_or_report_locked,
+)
 from organizer.telegram_ops import (
     clear_existing_folders,
     collect_chats_for_ai,
-    collect_dialog_map,
     create_client_with_retry,
     ensure_session_exists,
     get_existing_folders,
@@ -75,6 +81,7 @@ from organizer.telegram_ops import (
     update_folders_with_categorization,
     validate_groups_json,
 )
+from organizer.unassigned_review import review_unassigned_chats
 
 
 def _runtime_files(config):
@@ -92,119 +99,6 @@ def _runtime_files(config):
         "log": logs_dir / "run.log",
         "failed_batches": logs_dir / "failed_batches.json",
     }
-
-
-def _is_database_locked_error(exc: Exception) -> bool:
-    return "database is locked" in str(exc).lower()
-
-
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def _read_session_run_lock(lock_file: Path) -> dict:
-    try:
-        with lock_file.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _acquire_session_run_lock(session_name: str, sessions_dir: Path) -> Path:
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = sessions_dir / f"{session_name}.run.lock"
-    payload = {
-        "pid": os.getpid(),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "session_name": session_name,
-    }
-
-    for _ in range(2):
-        try:
-            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            existing = _read_session_run_lock(lock_file)
-            pid = existing.get("pid")
-            if isinstance(pid, int) and _pid_is_running(pid):
-                created_at = existing.get("created_at", "未知时间")
-                raise RuntimeError(
-                    "当前 session 正在被另一个整理流程使用。\n"
-                    f"- lock: {lock_file}\n"
-                    f"- pid: {pid}\n"
-                    f"- started: {created_at}\n"
-                    "请先结束另一个 python run.py / create_session.py 进程，再重新运行。"
-                )
-            logging.warning("Removing stale session run lock: %s", lock_file)
-            try:
-                lock_file.unlink()
-            except FileNotFoundError:
-                pass
-            continue
-
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        return lock_file
-
-    raise RuntimeError(f"无法创建 session 运行锁: {lock_file}")
-
-
-def _release_session_run_lock(lock_file: Path | None) -> None:
-    if lock_file is None:
-        return
-    existing = _read_session_run_lock(lock_file)
-    if existing.get("pid") != os.getpid():
-        return
-    try:
-        lock_file.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        logging.warning("Failed to release session run lock %s: %s", lock_file, exc)
-
-
-def _print_session_database_locked_message(session_file: Path) -> None:
-    print("\nTelegram session 数据库被锁定，已停止本次运行。")
-    print(f"- session: {session_file}")
-    print("- 常见原因：另一个 python run.py / create_session.py 正在使用同一个 session，或上一次运行刚异常退出。")
-    print("- 处理方式：关闭另一个终端里的运行进程，等待几秒后重试。")
-    print("- 不建议删除 .session 文件；删除后需要重新登录 Telegram。")
-
-
-async def _start_client_or_report_locked(client, session_file: Path) -> bool:
-    try:
-        await client.start()
-        return True
-    except sqlite3.OperationalError as exc:
-        if not _is_database_locked_error(exc):
-            raise
-        logging.error("Telegram session database is locked during start: %s", exc)
-        _print_session_database_locked_message(session_file)
-        return False
-
-
-async def _safe_disconnect_client(client) -> None:
-    if client is None:
-        return
-    try:
-        await client.disconnect()
-    except sqlite3.OperationalError as exc:
-        if _is_database_locked_error(exc):
-            logging.warning("Skip Telegram disconnect state save because session database is locked: %s", exc)
-            return
-        raise
-    except Exception as exc:
-        logging.warning("Telegram disconnect failed: %s", exc)
 
 
 def _migrate_legacy_files(config, files: dict[str, Path]) -> list[str]:
@@ -230,10 +124,6 @@ def _migrate_legacy_files(config, files: dict[str, Path]) -> list[str]:
     return moved
 
 
-def _build_chat_lookup(chats_for_ai: list[dict]) -> dict[int, dict]:
-    return {int(chat["chat_id"]): chat for chat in chats_for_ai if chat.get("chat_id") is not None}
-
-
 def _cache_has_recent_messages(chats_for_ai: list[dict]) -> bool:
     for chat in chats_for_ai:
         if not isinstance(chat, dict):
@@ -241,39 +131,6 @@ def _cache_has_recent_messages(chats_for_ai: list[dict]) -> bool:
         if "recent_messages" not in chat or "recent_messages_text" not in chat:
             return False
     return True
-
-
-def _print_draft_summary(categorized_data: dict, chats_for_ai: list[dict]) -> None:
-    chat_lookup = _build_chat_lookup(chats_for_ai)
-    lines, total = build_summary_lines(categorized_data, chat_lookup)
-    unassigned = compute_unassigned_chats(chats_for_ai, categorized_data)
-
-    print("\n草稿分类摘要：")
-    if lines:
-        for line in lines:
-            print(line)
-    else:
-        print("- 当前草稿没有任何分类项")
-    print(f"- 拟分类聊天总数: {total}")
-    print(f"- 未分类聊天数: {len(unassigned)}")
-
-
-def _suggest_folder_id(chat: dict, folders: list[dict]) -> int | None:
-    text = (
-        f"{chat.get('title', '')} "
-        f"{chat.get('description', '')} "
-        f"{chat.get('recent_messages_text', '')} "
-        f"{chat.get('last_message', '')}"
-    ).lower()
-    best_id = None
-    best_score = 0
-    for folder in folders:
-        tokens = [token for token in folder["title"].lower().split() if token]
-        score = sum(1 for token in tokens if token in text)
-        if score > best_score:
-            best_score = score
-            best_id = int(folder["id"])
-    return best_id if best_score > 0 else None
 
 
 async def _classify_with_ai_in_batches(
@@ -362,45 +219,6 @@ def _load_json_with_error(filename: str | Path) -> tuple[dict | None, str | None
         return None, f"读取文件失败: {exc}"
 
 
-def _save_failed_batches(path: Path, failed_batches: list[dict], context: dict | None = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "context": context or {},
-        "failed_batches": failed_batches,
-    }
-    try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        logging.info("Saved failed batches: %s", path)
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.warning("Failed to write %s: %s", path, exc)
-
-
-def _clear_failed_batches(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.warning("Failed to remove %s: %s", path, exc)
-
-
-def _load_failed_batches_chat_ids(path: Path) -> tuple[list[int], str | None]:
-    data, error = _load_json_with_error(path)
-    if data is None:
-        return [], error
-    chat_ids: list[int] = []
-    for item in data.get("failed_batches", []) or []:
-        for raw_id in item.get("chat_ids", []) or []:
-            try:
-                chat_ids.append(int(raw_id))
-            except (TypeError, ValueError):
-                continue
-    timestamp = str(data.get("timestamp", "")).strip() or None
-    return chat_ids, timestamp
-
-
 def _file_mtime_ns(path: Path) -> int | None:
     try:
         return path.stat().st_mtime_ns
@@ -487,168 +305,6 @@ async def _apply_review_files(
     return await _validate_draft_loop(files["draft"], valid_folder_ids, valid_chat_ids)
 
 
-def _print_execution_preview(categorized_data: dict, chats_for_ai: list[dict], folders: list[dict]) -> None:
-    folder_lookup = {int(folder["id"]): folder for folder in folders}
-    chat_lookup = _build_chat_lookup(chats_for_ai)
-    total_targets = 0
-
-    print("\n执行前预览：")
-    for folder_item in categorized_data.get("categorized", []):
-        folder_id = int(folder_item.get("folder_id"))
-        folder = folder_lookup.get(folder_id, {})
-        existing_count = len(folder.get("existing_peers", []))
-        chats = folder_item.get("chats", [])
-        total_targets += len(chats)
-        examples = []
-        for chat_item in chats[:3]:
-            chat = chat_lookup.get(int(chat_item.get("chat_id")), {})
-            examples.append(chat.get("title") or str(chat_item.get("chat_id")))
-        example_text = f"；示例: {', '.join(examples)}" if examples else ""
-        print(f"- {folder_item.get('folder_title', folder.get('title', 'Unknown'))}: 当前 {existing_count} 个，建议添加 {len(chats)} 个{example_text}")
-
-    unassigned = compute_unassigned_chats(chats_for_ai, categorized_data)
-    print(f"- 建议写入目标总数: {total_targets}")
-    print(f"- 保持未分类: {len(unassigned)}")
-
-
-def _extract_chat_id_from_peer(peer) -> int | None:
-    for attr in ("channel_id", "chat_id", "user_id"):
-        value = getattr(peer, attr, None)
-        if value:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _snapshot_folders(snapshot_dir: Path, folders: list[dict]) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = snapshot_dir / f"folder_snapshot_{timestamp}.json"
-    payload = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "folders": [],
-    }
-    for folder in folders:
-        peer_ids: list[int] = []
-        for peer in folder.get("existing_peers", []) or []:
-            chat_id = _extract_chat_id_from_peer(peer)
-            if chat_id is not None:
-                peer_ids.append(chat_id)
-        payload["folders"].append(
-            {
-                "folder_id": int(folder.get("id")),
-                "folder_title": str(folder.get("title", "")),
-                "existing_chat_ids": peer_ids,
-            }
-        )
-    save_json_file(path, payload)
-    return path
-
-
-def _export_execution_preview_csv(
-    path: Path,
-    categorized_data: dict,
-    chats_for_ai: list[dict],
-    folders: list[dict],
-    clear_folders: bool,
-) -> tuple[int, int, int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    chat_lookup = _build_chat_lookup(chats_for_ai)
-    folder_map = {int(f["id"]): f for f in folders}
-    add_count = keep_count = remove_count = 0
-
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            ["folder_id", "folder_title", "chat_id", "chat_title", "chat_type", "action", "reason"]
-        )
-
-        for folder_item in categorized_data.get("categorized", []):
-            try:
-                folder_id = int(folder_item.get("folder_id"))
-            except (TypeError, ValueError):
-                continue
-            folder_title = folder_item.get("folder_title", "")
-            folder = folder_map.get(folder_id, {})
-            existing_ids: set[int] = set()
-            for peer in folder.get("existing_peers", []) or []:
-                chat_id = _extract_chat_id_from_peer(peer)
-                if chat_id is not None:
-                    existing_ids.add(chat_id)
-
-            target_ids: set[int] = set()
-            for chat_item in folder_item.get("chats", []):
-                try:
-                    chat_id = int(chat_item.get("chat_id"))
-                except (TypeError, ValueError):
-                    continue
-                target_ids.add(chat_id)
-                chat = chat_lookup.get(chat_id, {})
-                action = "keep" if chat_id in existing_ids else "add"
-                if action == "add":
-                    add_count += 1
-                else:
-                    keep_count += 1
-                writer.writerow(
-                    [
-                        folder_id,
-                        folder_title,
-                        chat_id,
-                        chat.get("title", ""),
-                        chat_item.get("type", chat.get("type", "")),
-                        action,
-                        chat_item.get("reason", ""),
-                    ]
-                )
-
-            if clear_folders:
-                for chat_id in sorted(existing_ids - target_ids):
-                    chat = chat_lookup.get(chat_id, {})
-                    remove_count += 1
-                    writer.writerow(
-                        [
-                            folder_id,
-                            folder_title,
-                            chat_id,
-                            chat.get("title", ""),
-                            chat.get("type", ""),
-                            "remove",
-                            "clear-rebuild 移除",
-                        ]
-                    )
-
-    return add_count, keep_count, remove_count
-
-
-def _print_clear_report(report: dict) -> None:
-    print("\n清空结果：")
-    print(f"- 已清空文件夹: {report.get('cleared', 0)}")
-    print(f"- 跳过文件夹: {report.get('skipped', 0)}")
-    failed = report.get("failed", [])
-    if failed:
-        print(f"- 清空失败: {len(failed)}")
-        for item in failed[:5]:
-            print(f"  - {item.get('folder_title')} ({item.get('folder_id')}): {item.get('error')}")
-
-
-def _print_update_report(report: dict) -> None:
-    print("\n写入结果：")
-    print(f"- 成功更新文件夹: {report.get('folders_updated', 0)}")
-    print(f"- 新增聊天: {report.get('chats_added', 0)}")
-    print(f"- 跳过文件夹: {report.get('folders_skipped', 0)}")
-    missing_chats = report.get("missing_chats", [])
-    failed_folders = report.get("failed_folders", [])
-    if missing_chats:
-        print(f"- 未找到或无效聊天: {len(missing_chats)}")
-        for item in missing_chats[:5]:
-            print(f"  - chat_id={item.get('chat_id')}: {item.get('reason')}")
-    if failed_folders:
-        print(f"- 写入失败文件夹: {len(failed_folders)}")
-        for item in failed_folders[:5]:
-            print(f"  - {item.get('folder_title')} ({item.get('folder_id')}): {item.get('error')}")
-
-
 async def _validate_draft_loop(draft_file: Path, valid_folder_ids: set[int], valid_chat_ids: set[int]) -> dict:
     while True:
         data, load_error = _load_json_with_error(draft_file)
@@ -677,235 +333,6 @@ async def _validate_draft_loop(draft_file: Path, valid_folder_ids: set[int], val
         if keep_edit is not True:
             raise RuntimeError("你已取消流程。")
         await wait_for_enter(f"请编辑 {draft_file} 修正问题")
-
-
-def _chat_haystack(chat: dict) -> str:
-    return " ".join(
-        [
-            str(chat.get("title", "")),
-            str(chat.get("username", "")),
-            str(chat.get("description", "")),
-            str(chat.get("recent_messages_text", "")),
-            str(chat.get("last_message", "")),
-        ]
-    ).lower()
-
-
-def _parse_chat_id_tokens(text: str) -> set[int]:
-    ids: set[int] = set()
-    for token in re.split(r"[,\s]+", text or ""):
-        if not token:
-            continue
-        try:
-            ids.add(int(token))
-        except ValueError:
-            continue
-    return ids
-
-
-async def _review_unassigned_chats(categorized_data: dict, unassigned_chats: list[dict], folders: list[dict]) -> dict:
-    if not unassigned_chats:
-        print("未分类复核：无未分类聊天。")
-        return categorized_data
-
-    folder_lookup = {int(folder["id"]): folder["title"] for folder in folders}
-    print_unassigned_hint()
-    print_folder_picker(folders)
-    print(f"需要复核的未分类聊天数: {len(unassigned_chats)}")
-
-    pool: list[dict] = list(unassigned_chats)
-    handled_ids: set[int] = set()
-    queue: list[dict] = list(pool)
-    last_folder_id: int | None = None
-
-    def rebuild_queue_from_pool() -> list[dict]:
-        return [chat for chat in pool if int(chat["chat_id"]) not in handled_ids]
-
-    while queue:
-        chat = queue[0]
-        chat_id = int(chat["chat_id"])
-        title = chat.get("title", "未知")
-        chat_type = chat.get("type", "UNKNOWN")
-        description = chat.get("description") or chat.get("recent_messages_text") or chat.get("last_message") or ""
-        suggested_folder = _suggest_folder_id(chat, folders)
-
-        print("\n" + "-" * 88)
-        print(f"剩余 {len(queue)} 条（总未处理 {len(rebuild_queue_from_pool())}） | chat_id={chat_id} | {title} | {chat_type}")
-        if description:
-            print(f"摘要: {description[:160]}")
-        if suggested_folder is not None:
-            print(f"建议归类: {suggested_folder} ({folder_lookup[suggested_folder]})")
-
-        raw = await prompt_text("操作 [Enter/i 忽略 | m 归类 | b 批量 | s 过滤 | r 重置过滤 | g 分桶 | l 列表 | q 结束 | ?]: ")
-        if raw is None:
-            continue
-        cmd = raw.strip()
-        if not cmd:
-            cmd = "i"
-        head, _, rest = cmd.partition(" ")
-        head = head.lower()
-        rest = rest.strip()
-
-        if head == "q":
-            print("已结束未分类复核，剩余聊天保持未分类。")
-            break
-        if head == "?":
-            print_unassigned_hint()
-            continue
-        if head == "l":
-            print_folder_picker(folders)
-            continue
-        if head == "i":
-            handled_ids.add(chat_id)
-            queue.pop(0)
-            continue
-        if head == "g":
-            counts = Counter(str(c.get("type", "UNKNOWN")) for c in queue)
-            print("当前队列分桶:")
-            for chat_type_name, n in counts.most_common():
-                print(f"  {chat_type_name}: {n}")
-            continue
-        if head == "r":
-            queue = rebuild_queue_from_pool()
-            print(f"已重置过滤，当前队列 {len(queue)} 条。")
-            continue
-        if head == "s":
-            keyword = rest.lower()
-            if not keyword:
-                print("用法: s <关键词>")
-                continue
-            filtered = [c for c in rebuild_queue_from_pool() if keyword in _chat_haystack(c)]
-            if not filtered:
-                print(f"过滤后无匹配 '{keyword}'。")
-                continue
-            preview_limit = 30
-            print(f"过滤命中 {len(filtered)} 条（最多展示 {preview_limit}）：")
-            for idx, c in enumerate(filtered[:preview_limit], start=1):
-                print(f"  [{idx}] chat_id={c['chat_id']} | {c.get('title')} | {c.get('type')}")
-            if len(filtered) > preview_limit:
-                print(f"  ... 还有 {len(filtered) - preview_limit} 条未展示")
-            queue = filtered
-            continue
-        if head == "b":
-            parts = rest.split(maxsplit=1)
-            if not parts:
-                print("用法: b <folder_id> <chat_id1,chat_id2,...> 或 b <folder_id> all")
-                continue
-            try:
-                target_fid = int(parts[0])
-            except ValueError:
-                print("folder_id 必须是整数。")
-                continue
-            if target_fid not in folder_lookup:
-                print("folder_id 不存在。")
-                continue
-            selector = parts[1].strip() if len(parts) > 1 else ""
-            if not selector:
-                print("用法: b <folder_id> <chat_id1,chat_id2,...> 或 b <folder_id> all")
-                continue
-            if selector.lower() == "all":
-                target_chats = list(queue)
-            else:
-                target_ids = _parse_chat_id_tokens(selector)
-                if not target_ids:
-                    print("未解析到有效 chat_id。")
-                    continue
-                target_chats = [c for c in queue if int(c["chat_id"]) in target_ids]
-            if not target_chats:
-                print("当前队列里没有匹配的聊天（试试 r 重置过滤）。")
-                continue
-            confirmed = await prompt_yes_no(
-                f"确认把 {len(target_chats)} 条聊天归到 {folder_lookup[target_fid]} 吗？",
-                default=False,
-            )
-            if confirmed is not True:
-                continue
-            for c in target_chats:
-                add_chat_assignment(
-                    categorized_data=categorized_data,
-                    folder_id=target_fid,
-                    folder_title=folder_lookup[target_fid],
-                    chat=c,
-                    reason="手动批量归类",
-                )
-            assigned_set = {int(c["chat_id"]) for c in target_chats}
-            handled_ids |= assigned_set
-            queue = [c for c in queue if int(c["chat_id"]) not in assigned_set]
-            last_folder_id = target_fid
-            print(f"已批量归类 {len(target_chats)} 条到 {folder_lookup[target_fid]}。")
-            continue
-        if head == "m":
-            while True:
-                hint = f"输入 folder_id（l 列表 / c 取消，回车使用上次 {last_folder_id or '无'}）: "
-                raw_folder_id = await prompt_text(hint)
-                if raw_folder_id is None:
-                    continue
-                text = raw_folder_id.strip().lower()
-                if text == "":
-                    if last_folder_id is None:
-                        print("尚未选择过文件夹，不能直接回车。")
-                        continue
-                    target_folder_id = last_folder_id
-                elif text == "l":
-                    print_folder_picker(folders)
-                    continue
-                elif text == "c":
-                    break
-                elif text.startswith("all:"):
-                    try:
-                        bulk_folder_id = int(text.split(":", 1)[1])
-                    except ValueError:
-                        print("all: 后面必须是数字 folder_id。")
-                        continue
-                    if bulk_folder_id not in folder_lookup:
-                        print("folder_id 不存在。")
-                        continue
-                    confirmed = await prompt_yes_no(
-                        f"确认将剩余 {len(queue)} 个聊天全部归到 {folder_lookup[bulk_folder_id]} 吗？",
-                        default=False,
-                    )
-                    if confirmed is True:
-                        for rest_chat in queue:
-                            add_chat_assignment(
-                                categorized_data=categorized_data,
-                                folder_id=bulk_folder_id,
-                                folder_title=folder_lookup[bulk_folder_id],
-                                chat=rest_chat,
-                                reason="手动批量归类",
-                            )
-                        handled_ids |= {int(c["chat_id"]) for c in queue}
-                        queue = []
-                        print("已完成批量归类。")
-                        return categorized_data
-                    continue
-                else:
-                    try:
-                        target_folder_id = int(text)
-                    except ValueError:
-                        print("folder_id 必须是整数。")
-                        continue
-
-                if target_folder_id not in folder_lookup:
-                    print("folder_id 不存在，请输入当前文件夹列表中的 ID。")
-                    continue
-
-                add_chat_assignment(
-                    categorized_data=categorized_data,
-                    folder_id=target_folder_id,
-                    folder_title=folder_lookup[target_folder_id],
-                    chat=chat,
-                    reason="手动复核归类",
-                )
-                print(f"已手动归类: {title} -> {folder_lookup[target_folder_id]}")
-                last_folder_id = target_folder_id
-                handled_ids.add(chat_id)
-                queue.pop(0)
-                break
-            continue
-
-        print("未知命令。输入 ? 查看帮助。")
-
-    return categorized_data
 
 
 async def run_cli_wizard() -> None:
@@ -952,7 +379,7 @@ async def run_cli_wizard() -> None:
     session_lock_file = None
     client = None
     try:
-        session_lock_file = _acquire_session_run_lock(config.telegram.session_name, config.paths.sessions_dir)
+        session_lock_file = acquire_session_run_lock(config.telegram.session_name, config.paths.sessions_dir)
     except RuntimeError as exc:
         print(str(exc))
         return
@@ -966,7 +393,7 @@ async def run_cli_wizard() -> None:
             sessions_dir=config.paths.sessions_dir,
         )
         session_file = config.paths.sessions_dir / f"{config.telegram.session_name}.session"
-        if not await _start_client_or_report_locked(client, session_file):
+        if not await start_client_or_report_locked(client, session_file):
             return
         me = await client.get_me()
         display_name = me.username or me.first_name or str(me.id)
@@ -1092,7 +519,7 @@ async def run_cli_wizard() -> None:
                         ai_candidate_chats.append(chat)
                 print(f"需要 AI 新判断的聊天: {len(ai_candidate_chats)} 条")
 
-            failed_ids, failed_ts = _load_failed_batches_chat_ids(files["failed_batches"])
+            failed_ids, failed_ts = load_failed_batches_chat_ids(files["failed_batches"])
             candidate_id_set = set()
             for chat in ai_candidate_chats:
                 try:
@@ -1187,16 +614,16 @@ async def run_cli_wizard() -> None:
                             logging.warning("Failed to resume Telegram live updates: %s", exc)
 
                 if failed_batches:
-                    _save_failed_batches(
+                    save_failed_batches(
                         files["failed_batches"],
                         failed_batches,
                         context={"total_candidates": len(ai_candidate_chats)},
                     )
                 else:
-                    _clear_failed_batches(files["failed_batches"])
+                    clear_failed_batches(files["failed_batches"])
             else:
                 print("所有当前聊天都已命中分类记忆，跳过 AI 分类。")
-                _clear_failed_batches(files["failed_batches"])
+                clear_failed_batches(files["failed_batches"])
 
             folder_lookup = {int(folder["id"]): str(folder["title"]) for folder in classification_folders}
             initial_data = merge_categorization_results([memory_data, ai_result], folder_lookup)
@@ -1207,7 +634,7 @@ async def run_cli_wizard() -> None:
         csv_mtime_before_review = _file_mtime_ns(files["review_csv"])
 
         print_step(5, "审核建议")
-        _print_draft_summary(initial_data, chats_for_ai)
+        print_draft_summary(initial_data, chats_for_ai)
         print_draft_edit_hint(str(files["review_csv"]), str(files["draft"]))
         print_file_review_hint(str(files["review_csv"]), str(files["draft"]))
 
@@ -1232,11 +659,11 @@ async def run_cli_wizard() -> None:
             handle_unassigned = await prompt_yes_no("是否继续在终端处理剩余未分类聊天？", default=False)
             if handle_unassigned:
                 unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
-                validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
+                validated_data = await review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
         elif review_mode == "t":
             validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
             unassigned_chats = compute_unassigned_chats(chats_for_ai, validated_data)
-            validated_data = await _review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
+            validated_data = await review_unassigned_chats(validated_data, unassigned_chats, classification_folders)
         else:
             validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
 
@@ -1248,8 +675,8 @@ async def run_cli_wizard() -> None:
         print(f"分类记忆已更新: {files['memory']}（{memory_count} 条）")
 
         print_step(6, "执行前预览")
-        _print_draft_summary(validated_data, chats_for_ai)
-        _print_execution_preview(validated_data, chats_for_ai, folders)
+        print_draft_summary(validated_data, chats_for_ai)
+        print_execution_preview(validated_data, chats_for_ai, folders)
         first_confirm = await prompt_yes_no(
             f"确认采用当前草稿并生成 {files['final'].name} 吗？",
             default=False,
@@ -1279,7 +706,7 @@ async def run_cli_wizard() -> None:
         else:
             print("将采用增量添加模式。")
 
-        add_count, keep_count, remove_count = _export_execution_preview_csv(
+        add_count, keep_count, remove_count = export_execution_preview_csv(
             path=files["execution_preview"],
             categorized_data=validated_data,
             chats_for_ai=chats_for_ai,
@@ -1304,11 +731,11 @@ async def run_cli_wizard() -> None:
         print_step(7, "写入与报告")
         snapshot_path: Path | None = None
         if clear_folders:
-            snapshot_path = _snapshot_folders(config.paths.data_dir, folders)
+            snapshot_path = snapshot_folders(config.paths.data_dir, folders)
             print(f"清空前快照已保存: {snapshot_path}")
             print("正在清空文件夹（每个文件夹保留 1 个聊天）...")
             clear_report = await clear_existing_folders(client, classification_folders)
-            _print_clear_report(clear_report)
+            print_clear_report(clear_report)
             print("文件夹清空完成。")
 
         update_report = await update_folders_with_categorization(
@@ -1318,9 +745,9 @@ async def run_cli_wizard() -> None:
             existing_folders=folders,
             folders_were_cleared=bool(clear_folders),
         )
-        _print_update_report(update_report)
+        print_update_report(update_report)
 
-        _print_draft_summary(validated_data, chats_for_ai)
+        print_draft_summary(validated_data, chats_for_ai)
         print("\n执行完成：")
         if update_report.get("failed_folders") or update_report.get("missing_chats"):
             print("- Telegram 写入已完成，但存在跳过或失败项，请查看上方报告和日志")
@@ -1337,8 +764,8 @@ async def run_cli_wizard() -> None:
         print(f"- 文件夹信息: {files['folders']}")
         print(f"- 日志文件: {files['log']}")
     finally:
-        await _safe_disconnect_client(client)
-        _release_session_run_lock(session_lock_file)
+        await safe_disconnect_client(client)
+        release_session_run_lock(session_lock_file)
 
 
 def main() -> None:
