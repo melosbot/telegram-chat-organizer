@@ -33,7 +33,9 @@ def setup_logging(log_file: Path) -> None:
     file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    # Keep the terminal output clean: only show warnings/errors to the user;
+    # the file handler still captures full INFO-level history for postmortem.
+    console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)
