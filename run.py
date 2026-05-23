@@ -844,8 +844,6 @@ async def run_cli_wizard() -> None:
             validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
 
         save_json_file(files["draft"], validated_data)
-        validated_data = await _validate_draft_loop(files["draft"], folder_ids, chat_ids)
-        save_json_file(files["draft"], validated_data)
         export_classification_review_csv(files["review_csv"], validated_data, chats_for_ai)
         memory_count = export_classification_memory_csv(files["memory"], validated_data, chats_for_ai)
         print("审核完成。")
