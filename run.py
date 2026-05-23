@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import logging
 import os
@@ -85,6 +86,7 @@ def _runtime_files(config):
         "folder_rules": data_dir / "folder_rules.json",
         "memory": data_dir / "classification_memory.csv",
         "review_csv": data_dir / "classification_review.csv",
+        "execution_preview": data_dir / "execution_preview.csv",
         "log": logs_dir / "run.log",
         "failed_batches": logs_dir / "failed_batches.json",
     }
@@ -505,6 +507,116 @@ def _print_execution_preview(categorized_data: dict, chats_for_ai: list[dict], f
     unassigned = compute_unassigned_chats(chats_for_ai, categorized_data)
     print(f"- 建议写入目标总数: {total_targets}")
     print(f"- 保持未分类: {len(unassigned)}")
+
+
+def _extract_chat_id_from_peer(peer) -> int | None:
+    for attr in ("channel_id", "chat_id", "user_id"):
+        value = getattr(peer, attr, None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _snapshot_folders(snapshot_dir: Path, folders: list[dict]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = snapshot_dir / f"folder_snapshot_{timestamp}.json"
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "folders": [],
+    }
+    for folder in folders:
+        peer_ids: list[int] = []
+        for peer in folder.get("existing_peers", []) or []:
+            chat_id = _extract_chat_id_from_peer(peer)
+            if chat_id is not None:
+                peer_ids.append(chat_id)
+        payload["folders"].append(
+            {
+                "folder_id": int(folder.get("id")),
+                "folder_title": str(folder.get("title", "")),
+                "existing_chat_ids": peer_ids,
+            }
+        )
+    save_json_file(path, payload)
+    return path
+
+
+def _export_execution_preview_csv(
+    path: Path,
+    categorized_data: dict,
+    chats_for_ai: list[dict],
+    folders: list[dict],
+    clear_folders: bool,
+) -> tuple[int, int, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chat_lookup = _build_chat_lookup(chats_for_ai)
+    folder_map = {int(f["id"]): f for f in folders}
+    add_count = keep_count = remove_count = 0
+
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["folder_id", "folder_title", "chat_id", "chat_title", "chat_type", "action", "reason"]
+        )
+
+        for folder_item in categorized_data.get("categorized", []):
+            try:
+                folder_id = int(folder_item.get("folder_id"))
+            except (TypeError, ValueError):
+                continue
+            folder_title = folder_item.get("folder_title", "")
+            folder = folder_map.get(folder_id, {})
+            existing_ids: set[int] = set()
+            for peer in folder.get("existing_peers", []) or []:
+                chat_id = _extract_chat_id_from_peer(peer)
+                if chat_id is not None:
+                    existing_ids.add(chat_id)
+
+            target_ids: set[int] = set()
+            for chat_item in folder_item.get("chats", []):
+                try:
+                    chat_id = int(chat_item.get("chat_id"))
+                except (TypeError, ValueError):
+                    continue
+                target_ids.add(chat_id)
+                chat = chat_lookup.get(chat_id, {})
+                action = "keep" if chat_id in existing_ids else "add"
+                if action == "add":
+                    add_count += 1
+                else:
+                    keep_count += 1
+                writer.writerow(
+                    [
+                        folder_id,
+                        folder_title,
+                        chat_id,
+                        chat.get("title", ""),
+                        chat_item.get("type", chat.get("type", "")),
+                        action,
+                        chat_item.get("reason", ""),
+                    ]
+                )
+
+            if clear_folders:
+                for chat_id in sorted(existing_ids - target_ids):
+                    chat = chat_lookup.get(chat_id, {})
+                    remove_count += 1
+                    writer.writerow(
+                        [
+                            folder_id,
+                            folder_title,
+                            chat_id,
+                            chat.get("title", ""),
+                            chat.get("type", ""),
+                            "remove",
+                            "clear-rebuild 移除",
+                        ]
+                    )
+
+    return add_count, keep_count, remove_count
 
 
 def _print_clear_report(report: dict) -> None:
@@ -1025,6 +1137,19 @@ async def run_cli_wizard() -> None:
         else:
             print("将采用增量添加模式。")
 
+        add_count, keep_count, remove_count = _export_execution_preview_csv(
+            path=files["execution_preview"],
+            categorized_data=validated_data,
+            chats_for_ai=chats_for_ai,
+            folders=folders,
+            clear_folders=clear_folders,
+        )
+        print(
+            f"执行预览已导出: {files['execution_preview']} "
+            f"(add={add_count} keep={keep_count} remove={remove_count})"
+        )
+        print("- 请在 Excel/Sheets 打开预览 CSV，按 action 列过滤可确认每条操作")
+
         second_confirm = await prompt_yes_no(
             "确认把分类结果写入 Telegram 文件夹吗？",
             default=False,
@@ -1035,7 +1160,10 @@ async def run_cli_wizard() -> None:
             return
 
         print_step(7, "写入与报告")
+        snapshot_path: Path | None = None
         if clear_folders:
+            snapshot_path = _snapshot_folders(config.paths.data_dir, folders)
+            print(f"清空前快照已保存: {snapshot_path}")
             print("正在清空文件夹（每个文件夹保留 1 个聊天）...")
             clear_report = await clear_existing_folders(client, classification_folders)
             _print_clear_report(clear_report)
@@ -1059,6 +1187,9 @@ async def run_cli_wizard() -> None:
         print(f"- 草稿文件: {files['draft']}")
         print(f"- 最终结果: {files['final']}")
         print(f"- 审核 CSV: {files['review_csv']}")
+        print(f"- 执行预览 CSV: {files['execution_preview']}")
+        if snapshot_path is not None:
+            print(f"- 清空前快照: {snapshot_path}")
         print(f"- 分类记忆: {files['memory']}")
         print(f"- 聊天缓存: {files['chats']}")
         print(f"- 文件夹信息: {files['folders']}")
