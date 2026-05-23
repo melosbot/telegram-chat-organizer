@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import re
 import shutil
 import time
 from datetime import datetime
@@ -10,6 +9,8 @@ from typing import Any
 
 from telethon import TelegramClient, errors
 from telethon.tl import functions, types
+
+from .utils.text import dedupe_message_samples, flatten_message_text
 
 RECENT_MESSAGE_LIMIT = 10
 RECENT_MESSAGE_CHAR_LIMIT = 220
@@ -201,38 +202,11 @@ def validate_groups_json(data: dict) -> tuple[bool, str]:
 
 
 def _flatten_message_text(text: str) -> str:
-    return " ".join(str(text).split())
-
-
-def _message_identity_text(value: Any) -> str:
-    text = re.sub(r"^\d{2}-\d{2}\s+\d{2}:\d{2}\s+", "", str(value or ""))
-    text = _flatten_message_text(text).lower()
-    return text
-
-
-def _messages_are_duplicate(left: Any, right: Any) -> bool:
-    left_text = _message_identity_text(left)
-    right_text = _message_identity_text(right)
-    if not left_text or not right_text:
-        return False
-    if left_text == right_text:
-        return True
-    shorter, longer = sorted((left_text, right_text), key=len)
-    return len(shorter) >= 12 and shorter in longer
+    return flatten_message_text(text)
 
 
 def _dedupe_message_samples(samples: list[str], last_message: str = "") -> list[str]:
-    deduped = []
-    seen = set()
-    for sample in samples or []:
-        if not sample or _messages_are_duplicate(sample, last_message):
-            continue
-        identity = _message_identity_text(sample)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        deduped.append(sample)
-    return deduped
+    return dedupe_message_samples(samples, last_message)
 
 
 def _extract_message_excerpt(message, max_len: int = RECENT_MESSAGE_CHAR_LIMIT) -> str:

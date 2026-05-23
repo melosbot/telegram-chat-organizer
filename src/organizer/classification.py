@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .utils.text import message_identity_text, messages_are_duplicate
+
 
 FOLDER_RULES_VERSION = 1
 SKIP_REVIEW_STATUSES = {"skip", "ignore", "remove", "delete", "x", "no", "n", "忽略", "跳过", "删除"}
@@ -36,31 +38,14 @@ def _csv_context_text(value: Any, max_len: int) -> str:
     return _truncate(text, max_len)
 
 
-def _message_identity_text(value: Any) -> str:
-    text = re.sub(r"^\d{2}-\d{2}\s+\d{2}:\d{2}\s+", "", str(value or ""))
-    text = re.sub(r"\s+", " ", text).strip().lower()
-    return text
-
-
-def _messages_are_duplicate(left: Any, right: Any) -> bool:
-    left_text = _message_identity_text(left)
-    right_text = _message_identity_text(right)
-    if not left_text or not right_text:
-        return False
-    if left_text == right_text:
-        return True
-    shorter, longer = sorted((left_text, right_text), key=len)
-    return len(shorter) >= 12 and shorter in longer
-
-
 def _dedupe_recent_messages(recent_messages: list[Any], last_message: Any = "") -> list[str]:
     cleaned = []
     seen = set()
     for item in recent_messages or []:
         text = _csv_context_text(item, 220)
-        if not text or _messages_are_duplicate(text, last_message):
+        if not text or messages_are_duplicate(text, last_message):
             continue
-        identity = _message_identity_text(text)
+        identity = message_identity_text(text)
         if identity in seen:
             continue
         seen.add(identity)
