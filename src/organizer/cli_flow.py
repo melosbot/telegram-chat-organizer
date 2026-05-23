@@ -32,6 +32,7 @@ def print_startup_overview(config: AppConfig) -> None:
     print(f"- TELEGRAM_RECENT_MESSAGE_LIMIT: {config.telegram_recent_message_limit}")
     print(f"- TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT: {config.telegram_channel_recent_message_limit}")
     print(f"- TELEGRAM_SCAN_DELAY_SECONDS: {config.telegram_scan_delay_seconds}")
+    print(f"- TELEGRAM_SCAN_CONCURRENCY: {config.telegram_scan_concurrency}")
     print(f"- TELEGRAM_FETCH_FULL_INFO: {config.telegram_fetch_full_info}")
     print(f"- TELEGRAM_CACHE_SAVE_EVERY: {config.telegram_cache_save_every}")
     print(f"- DATA_DIR: {config.paths.data_dir}")

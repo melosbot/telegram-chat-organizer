@@ -1011,6 +1011,7 @@ async def run_cli_wizard() -> None:
                 fetch_full_info=config.telegram_fetch_full_info,
                 partial_save_filename=files["chats"],
                 partial_save_every=config.telegram_cache_save_every,
+                concurrency=config.telegram_scan_concurrency,
             )
             save_chats_info(chats_for_ai, files["chats"])
             print(f"收集完成并已缓存: {len(chats_for_ai)} 条")
@@ -1026,6 +1027,7 @@ async def run_cli_wizard() -> None:
                 fetch_full_info=config.telegram_fetch_full_info,
                 partial_save_filename=files["chats"],
                 partial_save_every=config.telegram_cache_save_every,
+                concurrency=config.telegram_scan_concurrency,
             )
             save_chats_info(chats_for_ai, files["chats"])
             print(f"收集完成并已缓存: {len(chats_for_ai)}")

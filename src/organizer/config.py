@@ -51,6 +51,7 @@ class AppConfig:
     telegram_recent_message_limit: int
     telegram_channel_recent_message_limit: int
     telegram_scan_delay_seconds: float
+    telegram_scan_concurrency: int
     telegram_fetch_full_info: bool
     telegram_cache_save_every: int
     paths: PathsConfig
@@ -221,6 +222,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
         telegram_recent_message_limit=_parse_int("TELEGRAM_RECENT_MESSAGE_LIMIT", 0, minimum=0),
         telegram_channel_recent_message_limit=_parse_int("TELEGRAM_CHANNEL_RECENT_MESSAGE_LIMIT", 1, minimum=0),
         telegram_scan_delay_seconds=_parse_float("TELEGRAM_SCAN_DELAY_SECONDS", 1.0, minimum=0.0),
+        telegram_scan_concurrency=_parse_int("TELEGRAM_SCAN_CONCURRENCY", 3, minimum=1),
         telegram_fetch_full_info=_parse_bool("TELEGRAM_FETCH_FULL_INFO", False),
         telegram_cache_save_every=_parse_int("TELEGRAM_CACHE_SAVE_EVERY", 10, minimum=1),
         paths=paths,

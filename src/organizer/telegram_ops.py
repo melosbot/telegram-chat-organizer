@@ -251,16 +251,42 @@ def _extract_message_excerpt(message, max_len: int = RECENT_MESSAGE_CHAR_LIMIT) 
     return ""
 
 
+async def _call_with_floodwait(coro_factory, what: str, max_retries: int = 2):
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except errors.FloodWaitError as exc:
+            wait_sec = int(getattr(exc, "seconds", 5)) + 1
+            if attempt >= max_retries:
+                logging.error("FloodWait on %s exceeded retries (waited %ds)", what, wait_sec)
+                raise
+            logging.warning(
+                "FloodWait on %s: sleeping %ds (attempt %d/%d)",
+                what,
+                wait_sec,
+                attempt + 1,
+                max_retries + 1,
+            )
+            await asyncio.sleep(wait_sec)
+    raise RuntimeError(f"unreachable floodwait loop for {what}")
+
+
 async def _fetch_recent_message_samples(
     client: TelegramClient,
     entity,
     limit: int = RECENT_MESSAGE_LIMIT,
 ) -> list[str]:
     request_limit = max(limit * 2, limit)
+    entity_id = getattr(entity, "id", "?")
     try:
-        messages = await client.get_messages(entity, limit=request_limit)
+        messages = await _call_with_floodwait(
+            lambda: client.get_messages(entity, limit=request_limit),
+            what=f"get_messages({entity_id})",
+        )
+    except errors.FloodWaitError:
+        raise
     except Exception as exc:
-        logging.debug("Could not fetch recent messages for entity %s: %s", getattr(entity, "id", "?"), exc)
+        logging.debug("Could not fetch recent messages for entity %s: %s", entity_id, exc)
         return []
 
     samples: list[str] = []
@@ -320,16 +346,24 @@ async def get_detailed_chat_info(
         if fetch_full_info and chat_info["type"] in {"CHANNEL", "SUPERGROUP", "GROUP"}:
             try:
                 if isinstance(entity, types.Channel):
-                    full_chat = await client(functions.channels.GetFullChannelRequest(entity))
+                    full_chat = await _call_with_floodwait(
+                        lambda: client(functions.channels.GetFullChannelRequest(entity)),
+                        what=f"GetFullChannelRequest({dialog.id})",
+                    )
                     full_info = getattr(full_chat, "full_chat", None)
                 else:
-                    full_chat = await client(functions.messages.GetFullChatRequest(entity.id))
+                    full_chat = await _call_with_floodwait(
+                        lambda: client(functions.messages.GetFullChatRequest(entity.id)),
+                        what=f"GetFullChatRequest({dialog.id})",
+                    )
                     full_info = getattr(full_chat, "full_chat", None)
                 if full_info:
                     if getattr(full_info, "about", None):
                         chat_info["description"] = full_info.about
                     if getattr(full_info, "participants_count", None):
                         chat_info["participant_count"] = full_info.participants_count
+            except errors.FloodWaitError:
+                raise
             except Exception as exc:
                 logging.debug("Could not fetch full chat info for %s: %s", dialog.id, exc)
 
@@ -381,11 +415,11 @@ async def collect_chats_for_ai(
     fetch_full_info: bool = True,
     partial_save_filename: str | Path | None = None,
     partial_save_every: int = 10,
+    concurrency: int = 1,
 ) -> tuple[list[dict], dict[int, Any]]:
-    dialogs = await client.get_dialogs()
-    dialog_map = {}
-    chats_for_ai = []
-    processed_count = 0
+    dialogs = await _call_with_floodwait(lambda: client.get_dialogs(), "get_dialogs")
+    dialog_map: dict[int, Any] = {}
+    targets: list[Any] = []
 
     for dialog in dialogs:
         entity = dialog.entity
@@ -403,22 +437,68 @@ async def collect_chats_for_ai(
             continue
 
         if chat_type in {"GROUP", "CHANNEL", "SUPERGROUP"}:
-            chat_info = await get_detailed_chat_info(
-                client=client,
-                dialog=dialog,
-                recent_message_limit=recent_message_limit,
-                channel_recent_message_limit=channel_recent_message_limit,
-                fetch_full_info=fetch_full_info,
-            )
-            chats_for_ai.append(chat_info)
-            processed_count += 1
-            if partial_save_filename and processed_count % partial_save_every == 0:
-                save_chats_info(chats_for_ai, partial_save_filename)
-            if processed_count % progress_every == 0:
-                logging.info("Collected %d chats for AI", processed_count)
+            targets.append(dialog)
+
+    total = len(targets)
+    if total == 0:
+        return [], dialog_map
+
+    effective_concurrency = max(1, min(concurrency, total))
+    semaphore = asyncio.Semaphore(effective_concurrency)
+    results: list[dict | None] = [None] * total
+    completed = 0
+    save_lock = asyncio.Lock()
+    logging.info(
+        "Scanning %d chats with concurrency=%d, scan_delay=%.2fs",
+        total,
+        effective_concurrency,
+        scan_delay_seconds,
+    )
+
+    async def process(idx: int, dialog) -> None:
+        nonlocal completed
+        async with semaphore:
+            try:
+                chat_info = await get_detailed_chat_info(
+                    client=client,
+                    dialog=dialog,
+                    recent_message_limit=recent_message_limit,
+                    channel_recent_message_limit=channel_recent_message_limit,
+                    fetch_full_info=fetch_full_info,
+                )
+            except errors.FloodWaitError as exc:
+                wait_sec = int(getattr(exc, "seconds", 5)) + 1
+                logging.warning(
+                    "FloodWait while scanning chat %s, sleeping %ds and retrying once",
+                    dialog.id,
+                    wait_sec,
+                )
+                await asyncio.sleep(wait_sec)
+                chat_info = await get_detailed_chat_info(
+                    client=client,
+                    dialog=dialog,
+                    recent_message_limit=recent_message_limit,
+                    channel_recent_message_limit=channel_recent_message_limit,
+                    fetch_full_info=fetch_full_info,
+                )
             if scan_delay_seconds > 0:
                 await asyncio.sleep(scan_delay_seconds)
 
+            results[idx] = chat_info
+
+            async with save_lock:
+                completed += 1
+                current = completed
+
+            if current % progress_every == 0:
+                logging.info("Collected %d/%d chats for AI", current, total)
+            if partial_save_filename and current % partial_save_every == 0:
+                chats_so_far = [r for r in results if r is not None]
+                save_chats_info(chats_so_far, partial_save_filename)
+
+    await asyncio.gather(*(process(i, dialog) for i, dialog in enumerate(targets)))
+
+    chats_for_ai = [r for r in results if r is not None]
     return chats_for_ai, dialog_map
 
 
