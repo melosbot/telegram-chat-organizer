@@ -179,11 +179,17 @@ def print_manual_fallback_hint(error_message: str, prompt: str) -> None:
 
 
 def print_unassigned_hint() -> None:
-    print("\n未分类聊天复核（更友好模式）：")
-    print("- i: 忽略当前聊天")
-    print("- m: 手动指定 folder_id")
+    print("\n未分类聊天复核命令：")
+    print("- Enter / i: 忽略当前聊天")
+    print("- m: 手动指定 folder_id（仍支持 all:<folder_id>）")
+    print("- b <folder_id> <chat_id,chat_id,...>: 批量归类指定聊天到该文件夹")
+    print("- b <folder_id> all: 把当前队列剩余聊天全部归到该文件夹")
+    print("- s <关键词>: 按 title/username/description 过滤队列")
+    print("- r: 重置过滤，恢复未处理队列")
+    print("- g: 按 chat_type 显示队列分桶数量")
     print("- l: 重新查看文件夹列表")
-    print("- q: 结束复核，剩余全部忽略")
+    print("- q: 结束复核，剩余全部保持未分类")
+    print("- ?: 重新显示本帮助")
 
 
 def print_folder_picker(folders: list[dict]) -> None:
