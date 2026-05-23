@@ -76,6 +76,7 @@ from organizer.telegram_ops import (
 
 def _runtime_files(config):
     data_dir = config.paths.data_dir
+    logs_dir = config.paths.logs_dir
     return {
         "draft": data_dir / "groups.draft.json",
         "final": data_dir / "groups.json",
@@ -84,7 +85,8 @@ def _runtime_files(config):
         "folder_rules": data_dir / "folder_rules.json",
         "memory": data_dir / "classification_memory.csv",
         "review_csv": data_dir / "classification_review.csv",
-        "log": config.paths.logs_dir / "run.log",
+        "log": logs_dir / "run.log",
+        "failed_batches": logs_dir / "failed_batches.json",
     }
 
 
@@ -277,7 +279,8 @@ async def _classify_with_ai_in_batches(
     batch_size: int,
     concurrency: int = 1,
     folder_rules: dict | None = None,
-) -> dict:
+    on_partial_result=None,
+) -> tuple[dict, list[dict]]:
     total_batches = max(1, ceil(len(chats_for_ai) / batch_size))
     batches = []
     for index in range(total_batches):
@@ -289,19 +292,57 @@ async def _classify_with_ai_in_batches(
     effective_concurrency = max(1, min(concurrency, total_batches))
     print(f"- AI 分类批次总数: {total_batches}，并发数: {effective_concurrency}")
     semaphore = asyncio.Semaphore(effective_concurrency)
+    folder_lookup = {folder["id"]: folder["title"] for folder in folders}
 
-    async def classify_one(index: int, batch: list[dict]) -> tuple[int, dict]:
+    async def classify_one(index: int, batch: list[dict]) -> tuple[int, dict | None, dict | None]:
         async with semaphore:
             print(f"- 开始 AI 分类批次 {index + 1}/{total_batches}，本批 {len(batch)} 条聊天")
-            batch_result = await ai_client.classify(batch, folders, folder_rules=folder_rules)
-            print(f"- 完成 AI 分类批次 {index + 1}/{total_batches}")
-            return index, batch_result
+            try:
+                batch_result = await ai_client.classify(batch, folders, folder_rules=folder_rules)
+                print(f"- 完成 AI 分类批次 {index + 1}/{total_batches}")
+                return index, batch_result, None
+            except (AIClientError, ValueError) as exc:
+                chat_ids = []
+                for chat in batch:
+                    try:
+                        chat_ids.append(int(chat.get("chat_id")))
+                    except (TypeError, ValueError):
+                        continue
+                logging.error(
+                    "AI classify batch %d/%d failed: %s",
+                    index + 1,
+                    total_batches,
+                    exc,
+                    exc_info=True,
+                )
+                print(f"- 批次 {index + 1}/{total_batches} 失败，已记录失败聊天，将继续后续批次。原因: {exc}")
+                return index, None, {
+                    "batch_index": index,
+                    "chat_ids": chat_ids,
+                    "error": str(exc),
+                }
 
-    completed = await asyncio.gather(*(classify_one(index, batch) for index, batch in batches))
-    results = [result for _, result in sorted(completed, key=lambda item: item[0])]
+    tasks = [asyncio.create_task(classify_one(index, batch)) for index, batch in batches]
+    results_by_index: dict[int, dict] = {}
+    failed_batches: list[dict] = []
 
-    folder_lookup = {folder["id"]: folder["title"] for folder in folders}
-    return merge_categorization_results(results, folder_lookup)
+    for coro in asyncio.as_completed(tasks):
+        index, batch_result, error = await coro
+        if error is not None:
+            failed_batches.append(error)
+            continue
+        results_by_index[index] = batch_result
+        if on_partial_result is not None:
+            ordered = [results_by_index[i] for i in sorted(results_by_index)]
+            partial_merged = merge_categorization_results(ordered, folder_lookup)
+            try:
+                on_partial_result(partial_merged, len(results_by_index), total_batches)
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.warning("partial result callback failed: %s", exc)
+
+    ordered_results = [results_by_index[i] for i in sorted(results_by_index)]
+    merged = merge_categorization_results(ordered_results, folder_lookup)
+    return merged, failed_batches
 
 
 def _load_json_with_error(filename: str | Path) -> tuple[dict | None, str | None]:
@@ -315,6 +356,45 @@ def _load_json_with_error(filename: str | Path) -> tuple[dict | None, str | None
         return None, f"JSON 解析失败: {exc}"
     except Exception as exc:  # pragma: no cover - defensive
         return None, f"读取文件失败: {exc}"
+
+
+def _save_failed_batches(path: Path, failed_batches: list[dict], context: dict | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "context": context or {},
+        "failed_batches": failed_batches,
+    }
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logging.info("Saved failed batches: %s", path)
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.warning("Failed to write %s: %s", path, exc)
+
+
+def _clear_failed_batches(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.warning("Failed to remove %s: %s", path, exc)
+
+
+def _load_failed_batches_chat_ids(path: Path) -> tuple[list[int], str | None]:
+    data, error = _load_json_with_error(path)
+    if data is None:
+        return [], error
+    chat_ids: list[int] = []
+    for item in data.get("failed_batches", []) or []:
+        for raw_id in item.get("chat_ids", []) or []:
+            try:
+                chat_ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+    timestamp = str(data.get("timestamp", "")).strip() or None
+    return chat_ids, timestamp
 
 
 def _file_mtime_ns(path: Path) -> int | None:
@@ -758,6 +838,28 @@ async def run_cli_wizard() -> None:
                         ai_candidate_chats.append(chat)
                 print(f"需要 AI 新判断的聊天: {len(ai_candidate_chats)} 条")
 
+            failed_ids, failed_ts = _load_failed_batches_chat_ids(files["failed_batches"])
+            candidate_id_set = set()
+            for chat in ai_candidate_chats:
+                try:
+                    candidate_id_set.add(int(chat.get("chat_id")))
+                except (TypeError, ValueError):
+                    continue
+            retry_ids = sorted({cid for cid in failed_ids if cid in candidate_id_set})
+            if retry_ids:
+                print(
+                    f"检测到上次失败批次记录（{failed_ts or '时间未知'}），"
+                    f"共 {len(retry_ids)} 条聊天可仅重试。"
+                )
+                retry_only = await prompt_yes_no("仅重试上次失败的聊天？", default=True)
+                if retry_only is True:
+                    retry_set = set(retry_ids)
+                    ai_candidate_chats = [
+                        chat for chat in ai_candidate_chats
+                        if int(chat.get("chat_id", 0) or 0) in retry_set
+                    ]
+                    print(f"已切换为仅重试 {len(ai_candidate_chats)} 条聊天。")
+
         print_step(4, "生成分类建议")
         if source_path:
             print(f"已加载已有草稿: {source_path}")
@@ -766,9 +868,21 @@ async def run_cli_wizard() -> None:
 
         if initial_data is None:
             ai_result = create_manual_draft_template()
+            failed_batches: list[dict] = []
             if ai_candidate_chats:
                 ai_client = create_ai_client(config)
                 updates_paused_for_ai = False
+                folder_lookup_for_save = {
+                    int(folder["id"]): str(folder["title"]) for folder in classification_folders
+                }
+
+                def _save_partial(partial_result: dict, done: int, total: int) -> None:
+                    merged = merge_categorization_results(
+                        [memory_data, partial_result], folder_lookup_for_save
+                    )
+                    save_json_file(files["draft"], merged)
+                    print(f"- 已保存增量草稿（{done}/{total} 批）: {files['draft']}")
+
                 try:
                     try:
                         await client.set_receive_updates(False)
@@ -777,20 +891,39 @@ async def run_cli_wizard() -> None:
                     except Exception as exc:
                         logging.warning("Failed to pause Telegram live updates: %s", exc)
 
-                    ai_result = await _classify_with_ai_in_batches(
+                    ai_result, failed_batches = await _classify_with_ai_in_batches(
                         ai_client=ai_client,
                         chats_for_ai=ai_candidate_chats,
                         folders=classification_folders,
                         batch_size=config.ai_batch_size,
                         concurrency=config.ai_concurrency,
                         folder_rules=folder_rules,
+                        on_partial_result=_save_partial,
                     )
-                    print("AI 分类完成，已生成草稿数据。")
+                    if failed_batches:
+                        failed_chat_count = sum(len(item.get("chat_ids", [])) for item in failed_batches)
+                        print(
+                            f"AI 分类完成：{len(failed_batches)} 个批次失败，"
+                            f"涉及 {failed_chat_count} 条聊天；详见 {files['failed_batches']}。"
+                        )
+                    else:
+                        print("AI 分类完成，已生成草稿数据。")
                 except (AIClientError, ValueError) as exc:
                     logging.error("AI classify failed: %s", exc, exc_info=True)
                     manual_prompt = build_manual_prompt(ai_candidate_chats, classification_folders, folder_rules=folder_rules)
                     print_manual_fallback_hint(str(exc), manual_prompt)
                     ai_result = create_manual_draft_template()
+                    failed_batches = [
+                        {
+                            "batch_index": -1,
+                            "chat_ids": [
+                                int(chat.get("chat_id"))
+                                for chat in ai_candidate_chats
+                                if chat.get("chat_id") is not None
+                            ],
+                            "error": str(exc),
+                        }
+                    ]
                 finally:
                     if updates_paused_for_ai:
                         try:
@@ -798,8 +931,18 @@ async def run_cli_wizard() -> None:
                             logging.info("Resumed Telegram live updates.")
                         except Exception as exc:
                             logging.warning("Failed to resume Telegram live updates: %s", exc)
+
+                if failed_batches:
+                    _save_failed_batches(
+                        files["failed_batches"],
+                        failed_batches,
+                        context={"total_candidates": len(ai_candidate_chats)},
+                    )
+                else:
+                    _clear_failed_batches(files["failed_batches"])
             else:
                 print("所有当前聊天都已命中分类记忆，跳过 AI 分类。")
+                _clear_failed_batches(files["failed_batches"])
 
             folder_lookup = {int(folder["id"]): str(folder["title"]) for folder in classification_folders}
             initial_data = merge_categorization_results([memory_data, ai_result], folder_lookup)
